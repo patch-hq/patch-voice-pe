@@ -1,0 +1,94 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host tests
+        run: |
+          cmake -S host_test -B /tmp/ht
+          cmake --build /tmp/ht -j4
+          ctest --test-dir /tmp/ht --output-on-failure
+
+  firmware:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the firmware version comes from `git describe`
+      - name: Build
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.3.2
+          target: esp32s3
+          command: >-
+            git config --global --add safe.directory '*' &&
+            idf.py build &&
+            esptool.py --chip esp32s3 merge_bin -o build/patch-voice-pe-factory.bin
+            --flash_mode dio --flash_size 16MB
+            0x0 build/bootloader/bootloader.bin
+            0x8000 build/partition_table/partition-table.bin
+            0xf000 build/ota_data_initial.bin
+            0x20000 build/patch-voice-device.bin
+      - name: Collect
+        run: |
+          mkdir -p out
+          cp build/patch-voice-device.bin out/patch-voice-pe.bin
+          cp build/patch-voice-pe-factory.bin out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: out/
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: firmware
+    environment:
+      name: github-pages
+      url: ${{ steps.pages.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: firmware
+          path: out
+      - name: Manifests
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Read by devices for self-updates.
+          printf '{"version":"%s","url":"https://github.com/%s/releases/download/%s/patch-voice-pe.bin"}\n' \
+            "$TAG" "$REPO" "$TAG" > out/manifest.json
+          # The setup page: ESP Web Tools needs the image on the same origin.
+          cp -r site pages
+          cp out/patch-voice-pe-factory.bin pages/
+          printf '{"name":"Patch Voice PE","version":"%s","new_install_prompt_erase":true,"builds":[{"chipFamily":"ESP32-S3","parts":[{"path":"patch-voice-pe-factory.bin","offset":0}]}]}\n' \
+            "$TAG" > pages/install-manifest.json
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --title "$TAG" --generate-notes \
+            out/patch-voice-pe.bin out/patch-voice-pe-factory.bin out/manifest.json
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages
+      - id: pages
+        uses: actions/deploy-pages@v4

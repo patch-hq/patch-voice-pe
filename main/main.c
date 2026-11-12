@@ -1,0 +1,867 @@
+// patch-voice-device firmware — entry point.
+//
+// Orchestrates the components defined in components/patch_*/. The runtime
+// behaviour follows spec/16-voice-device.md §Firmware responsibilities:
+//
+//   1. microWakeWord runs whenever device is unmuted + linked.
+//   2. Persistent control WSS to host (auto-reconnect).
+//   3. Wake fires (or accepted ring) → open audio WSS, stream PCM16 mic up,
+//      play PCM16 down.
+//   4. LED ring renders pds_state_t.
+//   5. Button: short-press = PTT / accept ring. Long-press = end session
+//      / dismiss ring.
+//   6. Mute switch cuts wake-word + audio session, notifies host.
+//   7. Wi-Fi reconnect via esp_wifi auto-reconnect.
+//   8. OTA poll once an hour.
+
+#include <stdio.h>
+#include <time.h>
+#include <string.h>
+#include <math.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/timers.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_netif_sntp.h"
+#include "nvs_flash.h"
+#include "driver/usb_serial_jtag.h"
+#include "esp_app_desc.h"
+#include "esp_mac.h"
+#include "esp_netif_ip_addr.h"
+#include <stdlib.h>
+
+#include "patch_device_state.h"
+#include "patch_ring_fsm.h"
+#include "patch_led.h"
+#include "patch_button.h"
+#include "patch_audio.h"
+#include "patch_codec.h"
+#include "patch_tts_render.h"
+#include "patch_dial.h"
+#include "nvs.h"
+#include "esp_timer.h"
+#include "patch_wakeword.h"
+#include "patch_control.h"
+#include "patch_provision.h"
+#include "patch_ota.h"
+
+static const char *TAG = "patch-main";
+#define FW_VERSION (esp_app_get_description()->version)
+
+static patch_provision_state_t s_prov;
+static pds_t s_state;
+static prf_t s_ring;
+static char s_active_session_id[64] = {0};
+static char s_active_chat_id[128] = {0};
+static char s_active_account_id[64] = {0};
+static char s_voice_token[1024] = {0};
+
+// Forward decls.
+static void on_control_inbound(const pcf_inbound_t *frame, void *user);
+static void on_control_link_up(void *user);
+static void on_control_link_down(void *user);
+static bool get_muted_cb(void *user);
+static void on_button(pb_event_t ev, void *user);
+static void on_wake_word(void *user);
+static void on_tts_started(void *user);
+static void on_tts_ended(void *user);
+static void on_transcript(bool meaningful, void *user);
+static void on_session_state(const char *state, void *user);
+static void on_audio_session_closed(void *user);
+static void render_state(void);
+
+// Conversation state shared by the audio callbacks, follow-up timer and interruption.
+static volatile bool s_tts_active = false;
+static volatile uint32_t s_session_gen = 0;  // bumped per audio session; stale timers check it
+static volatile bool s_reopen_after_close = false;
+#define FOLLOWUP_MS 5000  // follow-up window when Patch doesn't set one
+static volatile int s_followup_ms = FOLLOWUP_MS;
+
+// ---------- volume (the dial) ----------
+// Levels 0..10: 0 is mute, 7 is 0 dB on the DAC (with the codec's analog
+// output at +12 dB), each click is 2.5 dB.
+// Saved to NVS a moment after the dial stops so a spin is one flash write.
+#define VOL_MAX 10
+#define VOL_DEFAULT 7
+#define VOL_HALF_STEPS_PER_LEVEL 5
+static int s_volume = VOL_DEFAULT;
+static esp_timer_handle_t s_vol_save_timer;
+
+static void volume_apply(void) {
+    // Up to the default level the DAC attenuates. Above it the DAC stays at 0 dB, so
+    // full-scale replies never clip, and the extra gain goes through the
+    // reply limiter instead.
+    int steps = (s_volume - VOL_DEFAULT) * VOL_HALF_STEPS_PER_LEVEL;
+    int hs = s_volume == 0 ? -127 : (steps < 0 ? steps : 0);
+    float gain = steps > 0 ? powf(10.0f, (float)steps / 40.0f) : 1.0f;
+    patch_codec_set_dac_vol(hs);
+    patch_audio_set_reply_gain(gain);
+    ESP_LOGI(TAG, "volume %d/%d (dac %d half-steps, reply gain %.2f)", s_volume, VOL_MAX, hs, (double)gain);
+}
+
+static void volume_save_cb(void *arg) {
+    (void)arg;
+    nvs_handle_t h;
+    if (nvs_open("patch.cfg", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, "volume", (uint8_t)s_volume);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void volume_load(void) {
+    nvs_handle_t h;
+    uint8_t v;
+    if (nvs_open("patch.cfg", NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_u8(h, "volume", &v) == ESP_OK && v <= VOL_MAX) s_volume = v;
+        nvs_close(h);
+    }
+    const esp_timer_create_args_t a = { .callback = volume_save_cb, .name = "vol-save" };
+    esp_timer_create(&a, &s_vol_save_timer);
+    volume_apply();
+}
+
+static void volume_set(int level) {
+    if (level < 0) level = 0;
+    if (level > VOL_MAX) level = VOL_MAX;
+    s_volume = level;
+    volume_apply();
+    patch_led_show_level(s_volume, VOL_MAX);
+    esp_timer_stop(s_vol_save_timer);
+    esp_timer_start_once(s_vol_save_timer, 2000000);
+}
+
+static void on_dial(int delta, void *user) {
+    (void)user;
+    volume_set(s_volume + delta);
+}
+
+
+// ---------- Wi-Fi -----------------------------------------------------------
+//
+// Wi-Fi credentials come from wifi_provisioning_manager during first-boot
+// provisioning and are stored in the `nvs.net80211` partition that
+// esp_wifi reads automatically; on subsequent boots we just call
+// esp_wifi_start() and `esp_wifi_connect()` and the auto-reconnect path
+// handles drops.
+
+static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
+    (void)arg; (void)data;
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "wifi disconnected; reconnecting");
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ESP_LOGI(TAG, "wifi got ip");
+    }
+}
+
+// Bring up the netif + default event loop + the Wi-Fi driver itself. This MUST
+// run before either branch (subsequent-boot STA connect OR first-boot BLE
+// provisioning): wifi_prov_mgr_start_provisioning() internally calls
+// esp_wifi_set_mode(STA) and aborts with ESP_ERR_WIFI_NOT_INIT if the driver
+// was never esp_wifi_init()'d. Previously esp_wifi_init lived only inside
+// wifi_init_sta() (subsequent-boot path), so the very first provisioning boot
+// crash-looped. Init the stack once here; the two branches only start/connect.
+static void net_stack_init(void) {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi_event, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_wifi_event, NULL));
+    // TLS certificate checks need the real time; the clock starts at 1970.
+    // SNTP syncs once the network is up, and the TLS links retry until then.
+    esp_sntp_config_t sntp = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    esp_netif_sntp_init(&sntp);
+}
+
+static void wifi_init_sta(void) {
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    // After BLE provisioning the prov manager may already have started the
+    // driver; treat ESP_ERR_WIFI_* "already started/inited" as success rather
+    // than aborting (the subsequent-boot path starts from a clean stop).
+    esp_err_t se = esp_wifi_start();
+    if (se != ESP_OK && se != ESP_ERR_WIFI_CONN) ESP_ERROR_CHECK(se);
+    esp_err_t ce = esp_wifi_connect();
+    if (ce != ESP_OK && ce != ESP_ERR_WIFI_CONN) ESP_ERROR_CHECK(ce);
+}
+
+// ---------- ring timer ------------------------------------------------------
+//
+// Ticks once a second to drive the 30 s ring timeout. We could pair this with
+// any single-shot timer but keeping it in a periodic timer is simpler and the
+// extra wake-ups are negligible.
+
+// Worker that performs the ring-timeout dismiss off the FreeRTOS timer-service
+// task. The timer task has a deliberately small stack
+// (CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=2048) and MUST NOT call into the
+// websocket/TLS send path — doing so overflowed the timer task stack and
+// reset the device (observed on the F1-10 30s no-answer path). The control
+// send + state dispatch run here on an adequately sized stack instead.
+static void ring_timeout_dismiss_task(void *arg) {
+    (void)arg;
+    ESP_LOGI(TAG, "ring 30s timeout; dismissing");
+    patch_audio_ringtone_stop();
+    patch_control_send_ring_dismissed();
+    pds_dispatch(&s_state, PDS_EV_RING_TIMEOUT);
+    render_state();
+    vTaskDelete(NULL);
+}
+
+static void ring_tick_cb(TimerHandle_t t) {
+    (void)t;
+    int64_t now_ms = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
+    prf_out_t o = prf_tick(&s_ring, now_ms);
+    if (o == PRF_OUT_RING_DISMISSED_TIMEOUT) {
+        // Hand off to a task with a real stack — see comment above.
+        xTaskCreate(ring_timeout_dismiss_task, "ring-dismiss", 4096, NULL, 5, NULL);
+    }
+}
+
+// ---------- control link callbacks -----------------------------------------
+
+static void on_control_link_up(void *user) {
+    (void)user;
+    pds_dispatch(&s_state, PDS_EV_LINK_UP);
+    render_state();
+}
+
+static void on_control_link_down(void *user) {
+    (void)user;
+    pds_dispatch(&s_state, PDS_EV_LINK_DOWN);
+    render_state();
+    patch_audio_ringtone_stop();
+    if (patch_audio_session_active()) patch_audio_session_stop("user-button");
+}
+
+static bool get_muted_cb(void *user) { (void)user; return patch_button_is_muted(); }
+
+static void open_audio_session_now(void) {
+    if (s_active_session_id[0] == '\0') return;
+    patch_audio_session_cfg_t cfg = {
+        .daemon_host = s_prov.server_host,
+        .daemon_port = s_prov.server_port,
+        .use_tls     = s_prov.tls,
+        .session_id  = s_active_session_id,
+        // accountId + chatId come from the host's session_start frame so the
+        // audio.session_start identity matches the voice token's claims (the
+        // host mints the token bound to {accountId, deviceId, chatId}). The
+        // device declares exactly what the host told it — it never decodes
+        // the token.
+        .account_id  = s_active_account_id,
+        .surface_id  = s_prov.device_id,
+        .device_id   = s_prov.device_id, // surfaceKind=="device" coupling
+        .chat_id     = s_active_chat_id,
+        .voice_token = s_voice_token,
+        .on_tts_started     = on_tts_started,
+        .on_tts_ended       = on_tts_ended,
+        .on_transcript      = on_transcript,
+        .on_state           = on_session_state,
+        .on_session_closed  = on_audio_session_closed,
+    };
+    s_session_gen++;
+    s_tts_active = false;
+    patch_audio_session_start(&cfg);
+    patch_led_set_phase(PLED_PHASE_LISTENING);
+    pds_dispatch(&s_state, PDS_EV_AUDIO_SESSION_OPENED);
+    // The wake word stays on during the session: saying it while a reply
+    // plays interrupts the reply (see barge_in).
+    render_state();
+}
+
+static void on_control_inbound(const pcf_inbound_t *f, void *user) {
+    (void)user;
+    switch (f->kind) {
+        case PCF_FRAME_SESSION_START:
+            // The host mints the per-session HMAC voice token and pushes it
+            // in the session_start control frame (spec/16 §Wire protocol
+            // "Voice-token delivery"); the device replays it as the
+            // audio.session_start `token`. pcf_decode requires both fields, so
+            // by here they are both present and non-empty — no fallback.
+            snprintf(s_active_session_id, sizeof s_active_session_id, "%s", f->session_id);
+            snprintf(s_voice_token, sizeof s_voice_token, "%s", f->voice_token);
+            // accountId + chatId are carried on the session_start control frame
+            // (the host minted the voice token bound to exactly these), so the
+            // device replays them verbatim on audio.session_start — the audio
+            // server rejects any mismatch with the token's claims. The
+            // voice-device chat is the host's special speakers thread
+            // (thread_speakers); the host, not the firmware, names it.
+            snprintf(s_active_account_id, sizeof s_active_account_id, "%s", f->account_id);
+            snprintf(s_active_chat_id, sizeof s_active_chat_id, "%s", f->chat_id);
+            s_followup_ms = f->followup_ms > 0 ? f->followup_ms : FOLLOWUP_MS;
+            patch_led_set_followup_ms(s_followup_ms);
+            ESP_LOGI(TAG, "control: session_start sessionId=%s", s_active_session_id);
+            open_audio_session_now();
+            break;
+        case PCF_FRAME_RING: {
+            ESP_LOGI(TAG, "control: ring chatId=%s conv=%d", f->chat_id, (int)f->conversational);
+            int64_t now_ms = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
+            prf_on_ring(&s_ring, now_ms);
+            snprintf(s_active_chat_id, sizeof s_active_chat_id, "%s", f->chat_id);
+            pds_dispatch(&s_state, PDS_EV_RING_RECEIVED);
+            render_state();
+            patch_audio_ringtone_start();  // make the ring audible, not LED-only
+            break;
+        }
+        case PCF_FRAME_LED:
+            // Optional UI hint per spec. Map to abstract state if it would
+            // override normal local rendering — but our local FSM already
+            // covers idle/listening/agent-speaking/ringing, so we treat the
+            // hint as informational only (logged).
+            ESP_LOGI(TAG, "control: led hint=%d", (int)f->led_hint);
+            break;
+        case PCF_FRAME_ERROR:
+            ESP_LOGE(TAG, "control: error from daemon: %s", f->error_message);
+            break;
+        case PCF_FRAME_UNKNOWN:
+            break;
+    }
+}
+
+// ---------- audio callbacks -------------------------------------------------
+
+// After a reply the session stays open FOLLOWUP_MS for a follow-up. The host
+// doesn't tell the device when the user starts talking, so the device watches
+// its own mic level; if nobody speaks in the window the session ends and only
+// the wake word opens a new one.
+#define SPEECH_PEAK 5000          // mic frame peak that counts as someone talking
+#define SPEECH_POLLS 3            // consecutive 50 ms polls above it
+#define TRANSCRIPT_WAIT_MS 20000  // after speech, how long to wait for the host's transcript
+static volatile uint32_t s_tts_epoch = 0;
+static volatile bool s_followup_running = false;
+static volatile uint32_t s_transcript_epoch = 0;
+static volatile bool s_last_transcript_meaningful = false;
+
+static void end_session_now(const char *why) {
+    if (!patch_audio_session_active()) return;
+    ESP_LOGI(TAG, "ending session: %s", why);
+    patch_control_send_session_end(PCF_SESSION_END_AGENT_FINISHED);
+    patch_audio_session_stop("agent-finished");
+}
+
+static void followup_task(void *arg) {
+    (void)arg;
+    const uint32_t gen = s_session_gen;
+#define SESSION_GONE() (!patch_audio_session_active() || s_session_gen != gen)
+    // Let the whole reply play, including any further pieces of it.
+    for (;;) {
+        uint32_t epoch = s_tts_epoch;
+        for (int i = 0; i < 300 && patch_audio_playback_pending() > 0; i++) vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(600));
+        if (SESSION_GONE()) goto done;
+        if (!s_tts_active && epoch == s_tts_epoch && patch_audio_playback_pending() == 0) break;
+    }
+    patch_audio_reset_reply_mic_peak();
+    patch_led_set_phase(PLED_PHASE_FOLLOWUP);
+    uint32_t t_epoch = s_transcript_epoch;
+    uint32_t tts_epoch = s_tts_epoch;
+    int above = 0;
+    bool spoke = false;
+    for (int waited = 0; waited < s_followup_ms; waited += 50) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        if (SESSION_GONE() || s_tts_epoch != tts_epoch) goto done;
+        if (s_transcript_epoch != t_epoch) { spoke = true; break; }  // host already heard something
+        above = patch_audio_mic_peak() > SPEECH_PEAK ? above + 1 : 0;
+        if (above >= SPEECH_POLLS) { spoke = true; break; }
+    }
+    if (!spoke) { end_session_now("no follow-up"); goto done; }
+    patch_led_set_phase(PLED_PHASE_LISTENING);
+    for (int waited = 0; waited < TRANSCRIPT_WAIT_MS; waited += 100) {
+        if (SESSION_GONE() || s_tts_epoch != tts_epoch) goto done;
+        if (s_transcript_epoch != t_epoch) {
+            if (!s_last_transcript_meaningful) end_session_now("follow-up wasn't for us");
+            goto done;  // meaningful: on_transcript already moved to thinking
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    end_session_now("no transcript after speech");
+done:
+    s_followup_running = false;
+    vTaskDelete(NULL);
+}
+
+static void on_session_state(const char *state, void *u) {
+    (void)u;
+    if (strcmp(state, "thinking") == 0) patch_led_set_phase(PLED_PHASE_THINKING);
+}
+
+static void on_transcript(bool meaningful, void *u) {
+    (void)u;
+    s_last_transcript_meaningful = meaningful;
+    s_transcript_epoch++;
+    if (meaningful) patch_led_set_phase(PLED_PHASE_THINKING);
+}
+
+static void on_tts_started(void *u) {
+    (void)u;
+    s_tts_epoch++;
+    s_tts_active = true;
+    patch_led_set_phase(PLED_PHASE_SPEAKING);
+    pds_dispatch(&s_state, PDS_EV_TTS_STARTED);
+    render_state();
+}
+static void on_tts_ended(void *u) {
+    (void)u;
+    pds_dispatch(&s_state, PDS_EV_TTS_ENDED);
+    s_tts_active = false;
+    if (!s_followup_running) {
+        s_followup_running = true;
+        if (xTaskCreate(followup_task, "followup", 3072, NULL, 4, NULL) != pdPASS) s_followup_running = false;
+    }
+    render_state();
+}
+static void on_audio_session_closed(void *u) {
+    (void)u;
+    s_active_session_id[0] = '\0';
+    s_tts_active = false;
+    pds_dispatch(&s_state, PDS_EV_AUDIO_SESSION_CLOSED);
+    if (s_reopen_after_close && patch_control_is_linked() && !patch_button_is_muted()) {
+        s_reopen_after_close = false;
+        pds_dispatch(&s_state, PDS_EV_WAKE_FIRED);
+        patch_control_send_wake_detected();
+        render_state();
+        return;
+    }
+    s_reopen_after_close = false;
+    patch_led_set_phase(PLED_PHASE_NONE);
+    if (!patch_button_is_muted()) patch_wakeword_resume();
+    render_state();
+}
+
+
+// ---------- interrupting a reply ---------------------------------------------
+// The speaker sits beside the mics and the XMOS canceller only takes ~5 dB off
+// the device's own voice, so plain speech can't be told apart from it. A reply
+// is interrupted by the wake word or a button press instead: playback stops,
+// the session ends, and a fresh one opens straight away to listen.
+
+static bool reply_playing(void) {
+    return s_tts_active || patch_audio_playback_pending() > 0;
+}
+
+static void barge_in_task(void *arg) {
+    (void)arg;
+    patch_control_send_session_end(PCF_SESSION_END_USER_BUTTON);
+    patch_audio_session_stop("user-button");
+    vTaskDelay(pdMS_TO_TICKS(150));
+    // A deliberate stop doesn't always raise the socket-closed callback, so
+    // reopen here if it hasn't already.
+    if (s_reopen_after_close) on_audio_session_closed(NULL);
+    vTaskDelete(NULL);
+}
+
+// Called from the wake-word and button tasks, which must not block on the
+// network: the teardown runs on its own short task.
+static void barge_in(const char *why) {
+    if (!patch_audio_session_active() || s_reopen_after_close) return;
+    ESP_LOGI(TAG, "interrupting the reply (%s)", why);
+    s_reopen_after_close = true;
+    patch_led_set_phase(PLED_PHASE_LISTENING);
+    if (xTaskCreate(barge_in_task, "barge-in", 4096, NULL, 5, NULL) != pdPASS) s_reopen_after_close = false;
+}
+
+// ---------- wake word -------------------------------------------------------
+
+static void on_wake_word(void *u) {
+    (void)u;
+    if (patch_button_is_muted() || !patch_control_is_linked()) return;
+    if (patch_audio_session_active()) {
+        if (reply_playing()) barge_in("wake word");
+        return;  // already listening: nothing to do
+    }
+    pds_dispatch(&s_state, PDS_EV_WAKE_FIRED);
+    render_state();
+    patch_control_send_wake_detected();
+    // The host responds with `session_start`; the audio WSS opens then.
+}
+
+// ---------- button + mute ---------------------------------------------------
+
+static void on_button(pb_event_t ev, void *user) {
+    (void)user;
+    int64_t now_ms = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
+    switch (ev) {
+        case PB_EV_SHORT_PRESS:
+            if (s_state.state == PDS_STATE_RINGING) {
+                if (prf_on_accept(&s_ring) == PRF_OUT_RING_ACCEPTED) {
+                    patch_audio_ringtone_stop();  // silence the chime before the session opens
+                    patch_control_send_ring_accepted();
+                    pds_dispatch(&s_state, PDS_EV_RING_ACCEPTED);
+                    render_state();
+                }
+            } else if (patch_audio_session_active() && reply_playing()) {
+                barge_in("button");
+            } else if (!patch_audio_session_active() && !patch_button_is_muted()
+                       && patch_control_is_linked()) {
+                // Push-to-talk: behaves like a wake-word fire.
+                pds_dispatch(&s_state, PDS_EV_WAKE_FIRED);
+                render_state();
+                patch_control_send_wake_detected();
+            }
+            break;
+        case PB_EV_LONG_PRESS:
+            if (s_state.state == PDS_STATE_RINGING) {
+                if (prf_on_dismiss(&s_ring) == PRF_OUT_RING_DISMISSED_USER) {
+                    patch_audio_ringtone_stop();
+                    patch_control_send_ring_dismissed();
+                    pds_dispatch(&s_state, PDS_EV_RING_DISMISSED);
+                    render_state();
+                }
+            } else if (patch_audio_session_active()) {
+                patch_control_send_session_end(PCF_SESSION_END_USER_BUTTON);
+                patch_audio_session_stop("user-button");
+            }
+            (void)now_ms;
+            break;
+        case PB_EV_MUTE_ON:
+            ESP_LOGI(TAG, "mute switch ON");
+            patch_audio_ringtone_stop();
+            patch_wakeword_pause();
+            if (patch_audio_session_active()) {
+                patch_control_send_session_end(PCF_SESSION_END_USER_BUTTON);
+                patch_audio_session_stop("user-button");
+            }
+            patch_control_send_mute_changed(true);
+            pds_dispatch(&s_state, PDS_EV_MUTE_ON);
+            render_state();
+            break;
+        case PB_EV_MUTE_OFF:
+            ESP_LOGI(TAG, "mute switch OFF");
+            patch_control_send_mute_changed(false);
+            patch_wakeword_resume();
+            pds_dispatch(&s_state, PDS_EV_MUTE_OFF);
+            render_state();
+            break;
+        case PB_EV_LONG_LONG_PRESS:
+            // Factory-reset gesture (10 s hold). The credential wipe + reboot
+            // are owned by patch_button.c, which calls
+            // patch_provision_factory_reset()/esp_restart() the moment the
+            // gesture crosses its threshold — so by the time this event is
+            // delivered the device is on its way down. Nothing to do here but
+            // record it; no fallback, no second reset path.
+            ESP_LOGW(TAG, "factory-reset gesture observed; device restarting");
+            break;
+    }
+}
+
+static void render_state(void) {
+    patch_led_set(s_state.state);
+    // Emit the LED-ring state over serial so the rendered indication is
+    // observable on a headless bench (no camera on the ring). The string is
+    // the same pds_state_t that drives the physical LED pattern table.
+    ESP_LOGI(TAG, "led: %s", pds_state_str(s_state.state));
+}
+
+// ---------- serial bench-diagnostic console --------------------------------
+//
+// A tiny line reader over the USB-Serial-JTAG console so an unattended bench
+// (no human at the device) can actuate the inputs that are otherwise physical
+// gestures, to verify the REAL on-device firmware response. Commands:
+//
+//   mute on      -> drive the physical mute-switch line (GPIO3) LOW, as if the
+//                   slider were moved to muted. Exercises the genuine poll-task
+//                   PB_EV_MUTE_ON path on the flashed unit.
+//   mute off     -> release the line back to the physical slider (PB_EV_MUTE_OFF).
+//
+// This is a test seam, gated to the serial console only; it does not affect
+// normal (no-input) operation. It electrically drives the same input pin the
+// firmware reads — it is not a host-FSM stub.
+
+// ---------- setup over USB -------------------------------------------------
+// Lines the web setup page (or a person) types into the console. Replies
+// starting "SETUP " are machine-readable for the page.
+static char s_setup_ssid[33];
+static char s_setup_pass[65];
+static bool s_setup_ssid_set;
+
+static bool copy_fits(char *dst, size_t cap, const char *src) {
+    size_t n = strlen(src);
+    if (n >= cap) return false;
+    memcpy(dst, src, n + 1);
+    return true;
+}
+
+static void setup_status(void) {
+    patch_provision_state_t p;
+    bool ready = patch_provision_load(&p);
+    char ip[16] = "";
+    esp_netif_ip_info_t info;
+    esp_netif_t *n = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (n && esp_netif_get_ip_info(n, &info) == ESP_OK && info.ip.addr) {
+        snprintf(ip, sizeof ip, IPSTR, IP2STR(&info.ip));
+    }
+    time_t now_t = time(NULL);
+    printf("SETUP {\"time\":%lld,\"version\":\"%s\",\"deviceId\":\"%s\",\"server\":\"%s\",\"wifi\":%s,"
+           "\"ready\":%s,\"ip\":\"%s\",\"updateUrl\":\"%s\"}\n",
+           (long long)now_t, FW_VERSION, p.device_id, p.server_url, patch_provision_wifi_configured() ? "true" : "false",
+           ready ? "true" : "false", ip, p.update_url);
+}
+
+// Returns true if the line was a setup command.
+static bool handle_setup_line(const char *line) {
+    if (strncmp(line, "set wifi-password ", 18) == 0) {
+        printf(copy_fits(s_setup_pass, sizeof s_setup_pass, line + 18) ? "SETUP ok wifi-password\n"
+               : "SETUP error wifi-password: longer than 64 characters\n");
+    } else if (strcmp(line, "set wifi-password") == 0) {
+        s_setup_pass[0] = '\0';
+        printf("SETUP ok wifi-password\n");
+    } else if (strncmp(line, "set wifi ", 9) == 0) {
+        s_setup_ssid_set = copy_fits(s_setup_ssid, sizeof s_setup_ssid, line + 9);
+        printf(s_setup_ssid_set ? "SETUP ok wifi\n" : "SETUP error wifi: longer than 32 characters\n");
+    } else if (strncmp(line, "set server ", 11) == 0) {
+        printf(patch_provision_set("server", line + 11) ? "SETUP ok server\n"
+               : "SETUP error server: use https://host or http://host:port\n");
+    } else if (strncmp(line, "set token ", 10) == 0) {
+        printf(patch_provision_set("token", line + 10) ? "SETUP ok token\n"
+               : "SETUP error token: not a Patch device token\n");
+    } else if (strncmp(line, "set update-url ", 15) == 0) {
+        printf(patch_provision_set("update-url", line + 15) ? "SETUP ok update-url\n"
+               : "SETUP error update-url\n");
+    } else if (strcmp(line, "apply") == 0) {
+        if (s_setup_ssid_set && !patch_provision_set_wifi(s_setup_ssid, s_setup_pass)) {
+            printf("SETUP error wifi: name or password too long\n");
+            return true;
+        }
+        printf("SETUP ok apply; restarting\n");
+        vTaskDelay(pdMS_TO_TICKS(300));
+        esp_restart();
+    } else if (strcmp(line, "status") == 0) {
+        setup_status();
+    } else if (strcmp(line, "forget") == 0) {
+        patch_provision_factory_reset();
+        printf("SETUP ok forget\n");
+    } else if (strcmp(line, "update-check") == 0) {
+        patch_ota_check_now();
+        printf("SETUP ok update-check\n");
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static void handle_diag_line(const char *line) {
+    if (handle_setup_line(line)) return;
+    if (strcmp(line, "mute on") == 0) {
+        ESP_LOGW(TAG, "diag: mute on");
+        patch_button_force_mute_line(true);
+    } else if (strcmp(line, "mute off") == 0) {
+        ESP_LOGW(TAG, "diag: mute off");
+        patch_button_force_mute_line(false);
+    } else if (strcmp(line, "mute read") == 0) {
+        ESP_LOGW(TAG, "diag: mute gpio level=%d is_muted=%d",
+                 patch_button_read_mute_gpio(), (int)patch_button_is_muted());
+    } else if (strcmp(line, "wake") == 0) {
+        // Fake a wake-word hit: sends wake_detected on the control WS so the
+        // host opens a voice session (same path the real wakeword uses). Lets
+        // us drive end-to-end host TTS without speaking aloud.
+        ESP_LOGW(TAG, "diag: forcing wake_detected");
+        bool ok = patch_control_send_wake_detected();
+        ESP_LOGW(TAG, "diag: wake_detected sent=%d", (int)ok);
+    } else if (strcmp(line, "button down") == 0) {
+        ESP_LOGW(TAG, "diag: button down");
+        patch_button_force_press(1);
+    } else if (strcmp(line, "button up") == 0) {
+        ESP_LOGW(TAG, "diag: button up");
+        patch_button_force_press(0);
+    } else if (strcmp(line, "button release") == 0) {
+        ESP_LOGW(TAG, "diag: button release-override");
+        patch_button_force_press(-1);
+    } else if (strcmp(line, "button read") == 0) {
+        ESP_LOGW(TAG, "diag: button gpio level=%d (0==pressed)",
+                 patch_button_read_button_gpio());
+    } else if (strcmp(line, "button trace") == 0) {
+        // Sample the raw action-button GPIO0 line for ~8s so an operator can
+        // press the physical button and confirm the level actually drops on the
+        // flashed unit (real-press readability check; no override involved).
+        ESP_LOGW(TAG, "diag: button trace start (press the physical button now)");
+        int last = -1;
+        for (int i = 0; i < 800; ++i) {
+            int lvl = patch_button_read_button_gpio();
+            if (lvl != last) {
+                ESP_LOGW(TAG, "diag: button gpio -> %d at %d ms", lvl, i * 10);
+                last = lvl;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        ESP_LOGW(TAG, "diag: button trace end");
+    } else if (strncmp(line, "tone", 4) == 0 && line[4] != 'c') {  // not "tonecap"
+        // Local tone self-test (no daemon/session) for host-mic IMD measurement.
+        //   "tone"               -> two-tone 300+3300 @ amp 6000
+        //   "tone <amp>"         -> two-tone 300+3300 @ <amp>
+        //   "tone <amp> <fa> <fb>" -> custom (fb=0 => single tone)
+        int amp = 6000, fa = 300, fb = 3300;
+        sscanf(line + 4, "%d %d %d", &amp, &fa, &fb);
+        ESP_LOGW(TAG, "diag: tone amp=%d fa=%d fb=%d", amp, fa, fb);
+        patch_audio_play_test_tone(fa, fb, amp, 3000);
+    } else if (strncmp(line, "speech", 6) == 0 && line[6] != 'f') {
+        // Local real-speech self-test. "speech" = native level; "speech <pct>"
+        // scales amplitude (e.g. 200 = 2x, louder for a host-mic capture).
+        int pct = 100;
+        sscanf(line + 6, "%d", &pct);
+        ESP_LOGW(TAG, "diag: speech (direct path, scale=%d%%)", pct);
+        patch_audio_play_embedded_speech_scaled(pct);
+    } else if (strncmp(line, "ptm", 3) == 0) {
+        int v = 8;
+        sscanf(line + 3, "%i", &v);   // %i parses 0x.. too
+        ESP_LOGW(TAG, "diag: DAC PTM = 0x%02x", v);
+        patch_codec_set_dac_ptm((uint8_t)v);
+    } else if (strncmp(line, "outgain ", 8) == 0) {
+        int hp = -2, lo = 0;
+        sscanf(line + 8, "%d %d", &hp, &lo);
+        patch_codec_set_out_gain(hp, lo);
+    } else if (strncmp(line, "gain ", 5) == 0) {
+        patch_audio_set_reply_gain((float)atof(line + 5));
+    } else if (strncmp(line, "vol ", 4) == 0) {
+        volume_set(atoi(line + 4));
+    } else if (strncmp(line, "dacvol", 6) == 0) {
+        int hs = PATCH_TTS_DAC_VOL_HALF_STEPS;  // default boot level
+        sscanf(line + 6, "%d", &hs);
+        ESP_LOGW(TAG, "diag: DAC vol = %d half-steps (%.1f dB)", hs, hs * 0.5);
+        patch_codec_set_dac_vol(hs);
+    } else if (strncmp(line, "amp", 3) == 0) {
+        int on = 0;
+        sscanf(line + 3, "%d", &on);
+        ESP_LOGW(TAG, "diag: speaker amp -> %s", on ? "ON" : "OFF");
+        patch_codec_amp_enable(on != 0);
+    } else if (strncmp(line, "tonecap", 7) == 0) {
+        // Close-field two-tone capture for objective IMD measurement.
+        int f1 = 300, f2 = 3300;
+        sscanf(line + 7, "%d %d", &f1, &f2);
+        ESP_LOGW(TAG, "diag: tonecap %d+%d", f1, f2);
+        patch_audio_miccap_tone_f1 = f1;
+        patch_audio_miccap_tone_f2 = f2;
+        patch_audio_miccap(100);
+        patch_audio_miccap_tone_f1 = 0;
+        patch_audio_miccap_tone_f2 = 0;
+    } else if (strncmp(line, "miccap", 6) == 0) {
+        int pct = 200;
+        sscanf(line + 6, "%d", &pct);
+        ESP_LOGW(TAG, "diag: miccap scale=%d%%", pct);
+        patch_audio_miccap(pct);
+    } else if (strcmp(line, "speechfeed") == 0) {
+        // Same clip via the feeder/stream-buffer path (daemon-TTS path) for A/B.
+        ESP_LOGW(TAG, "diag: speechfeed (embedded, FEEDER path)");
+        patch_audio_play_embedded_speech_via_feeder();
+    } else if (strncmp(line, "xmos", 4) == 0) {
+        // Live A/B of XMOS mic-pipeline stages (0=NONE 1=AEC 2=IC 3=NS 4=AGC).
+        // "xmos <ch0> <ch1>" — to test whether XMOS DSP processing causes the
+        // playback IMD (set both to 0=NONE and re-measure the two-tone).
+        int a = 0, b = 0;
+        sscanf(line + 4, "%d %d", &a, &b);
+        ESP_LOGW(TAG, "diag: xmos pipeline ch0=%d ch1=%d -> %d", a, b,
+                 (int)patch_codec_set_xmos_pipeline(a, b));
+    } else if (line[0] != '\0') {
+        ESP_LOGW(TAG, "diag: unknown command '%s' "
+                      "(try: mute on|off|read, button down|up|release, tone, xmos)", line);
+    }
+}
+
+static void diag_console_task(void *arg) {
+    (void)arg;
+    usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    // Room for a whole setup line (a device token is ~500 characters) arriving
+    // in one burst.
+    cfg.rx_buffer_size = 2048;
+    if (usb_serial_jtag_driver_install(&cfg) != ESP_OK) {
+        ESP_LOGW(TAG, "diag console unavailable (driver install failed)");
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "console ready (type 'status')");
+    static char buf[1400];
+    size_t len = 0;
+    for (;;) {
+        uint8_t c;
+        int n = usb_serial_jtag_read_bytes(&c, 1, pdMS_TO_TICKS(200));
+        if (n <= 0) continue;
+        // (one byte at a time: the 2 KB driver buffer holds a burst meanwhile)
+        if (c == '\r' || c == '\n') {
+            if (len > 0) {
+                buf[len] = '\0';
+                handle_diag_line(buf);
+                len = 0;
+            }
+        } else if (len < sizeof(buf) - 1) {
+            buf[len++] = (char)c;
+        } else {
+            len = 0; // overflow — drop the line
+        }
+    }
+}
+
+void app_main(void) {
+    printf("patch voice-device boot, fw=%s\n", FW_VERSION);
+
+    esp_err_t r = nvs_flash_init();
+    if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    }
+
+    pds_init(&s_state);
+    prf_init(&s_ring);
+    patch_led_init();
+    render_state();
+
+    // The Wi-Fi driver must be initialised before EITHER branch — the BLE
+    // provisioning manager calls esp_wifi_set_mode() internally.
+    net_stack_init();
+
+    bool provisioned = patch_provision_load(&s_prov);
+
+    // Bring up audio + the diag console FIRST — independent of network/provisioning
+    // (codec/I2S/XMOS are all local). This guarantees the device produces audio
+    // (and the local 'tone' self-test works) even before/while it is provisioned,
+    // and keeps the console available during the blocking BLE provisioning flow.
+    patch_audio_init();
+    patch_button_init(on_button, NULL);
+    volume_load();
+    patch_led_set_level_source(patch_audio_play_level);
+    patch_led_set_followup_ms(FOLLOWUP_MS);
+    patch_dial_init(on_dial, NULL);
+    patch_wakeword_init(on_wake_word, NULL);
+    xTaskCreate(diag_console_task, "patch-diag", 6144, NULL, 4, NULL);
+
+    if (!provisioned || !patch_provision_wifi_configured()) {
+        // Waiting to be set up over USB (the web setup page drives these
+        // console commands). Audio, the console and local tests keep working.
+        ESP_LOGW(TAG, "not set up yet. Over the USB console: set wifi <name>, "
+                      "set wifi-password <password>, set server <url>, set token <token>, apply");
+        patch_led_set(PDS_STATE_PAIRING_IN_PROGRESS);
+        for (;;) vTaskDelay(pdMS_TO_TICKS(60000));
+    }
+    wifi_init_sta();
+
+    patch_control_cfg_t ccfg = {
+        .daemon_host = s_prov.server_host,
+        .daemon_port = s_prov.server_port,
+        .use_tls     = s_prov.tls,
+        .device_id   = s_prov.device_id,
+        .fw_version  = FW_VERSION,
+        .bearer_jwt  = s_prov.token,
+        .on_inbound   = on_control_inbound,
+        .on_link_up   = on_control_link_up,
+        .on_link_down = on_control_link_down,
+        .get_muted    = get_muted_cb,
+        .user = NULL,
+    };
+    patch_control_start(&ccfg);
+
+    TimerHandle_t ring_tmr = xTimerCreate("patch-ring", pdMS_TO_TICKS(1000),
+                                          pdTRUE, NULL, ring_tick_cb);
+    xTimerStart(ring_tmr, 0);
+
+    char hostname[32];
+    uint8_t mac[6];
+    esp_efuse_mac_get_default(mac);
+    snprintf(hostname, sizeof hostname, "patch-voice-%02x%02x%02x", mac[3], mac[4], mac[5]);
+    patch_ota_start(FW_VERSION, s_prov.update_url, s_prov.token, hostname);
+
+    ESP_LOGI(TAG, "patch voice-device init complete; deviceId=%s", s_prov.device_id);
+    // app_main returns; FreeRTOS keeps running tasks.
+}

@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Patch Voice PE setup</title>
+    <script
+      type="module"
+      src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"
+    ></script>
+    <style>
+      body {
+        font:
+          16px/1.5 -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        max-width: 640px;
+        margin: 40px auto;
+        padding: 0 20px;
+        color: #1c1c1c;
+      }
+      h1 {
+        font-size: 24px;
+      }
+      h2 {
+        font-size: 18px;
+        margin-top: 32px;
+      }
+      label {
+        display: block;
+        margin: 12px 0 4px;
+        font-weight: 500;
+      }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 8px 10px;
+        font: inherit;
+        border: 1px solid #ccc;
+        border-radius: 8px;
+      }
+      button {
+        font: inherit;
+        padding: 8px 16px;
+        border-radius: 8px;
+        border: 1px solid #1c1c1c;
+        background: #1c1c1c;
+        color: #fff;
+        cursor: pointer;
+        margin-top: 16px;
+      }
+      button:disabled {
+        opacity: 0.4;
+        cursor: default;
+      }
+      .muted {
+        color: #666;
+        font-size: 14px;
+      }
+      #log {
+        white-space: pre-wrap;
+        font:
+          13px ui-monospace,
+          Menlo,
+          monospace;
+        background: #f4f4f2;
+        border-radius: 8px;
+        padding: 10px;
+        min-height: 40px;
+      }
+      .warn {
+        background: #fff4e0;
+        border-radius: 8px;
+        padding: 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Patch Voice PE</h1>
+    <p>
+      Turns a Home Assistant Voice Preview Edition into a voice device for
+      <a href="https://github.com/patch-hq/patch">Patch</a>. Use Chrome or Edge
+      on a computer, and connect the Voice PE with a USB-C cable.
+    </p>
+    <p id="unsupported" class="warn" hidden>
+      This browser can't talk to USB devices. Use Chrome or Edge on a computer.
+    </p>
+
+    <h2>1. Install the firmware</h2>
+    <p class="muted">
+      Replaces whatever is on the device. Skip this if it already runs Patch
+      Voice PE.
+    </p>
+    <esp-web-install-button
+      manifest="install-manifest.json"
+    ></esp-web-install-button>
+
+    <h2>2. Connect it to Wi-Fi and Patch</h2>
+    <p class="muted">
+      In Patch, open Settings → Voice → Voice devices → Add device, and copy the
+      server address and token it shows.
+    </p>
+    <label for="ssid">Wi-Fi network (2.4 GHz)</label>
+    <input id="ssid" autocomplete="off" />
+    <label for="pass">Wi-Fi password</label>
+    <input id="pass" type="password" autocomplete="off" />
+    <label for="server">Patch server address</label>
+    <input
+      id="server"
+      placeholder="https://patch.example.com"
+      autocomplete="off"
+    />
+    <label for="token">Device token</label>
+    <input id="token" autocomplete="off" />
+    <button id="send">Connect and save</button>
+    <p class="muted">
+      The device restarts and connects. The light ring turns off when it is
+      ready; say "Hey Jarvis" to talk.
+    </p>
+    <div id="log"></div>
+
+    <h2>Updates</h2>
+    <p class="muted">
+      The device installs new releases by itself. To push a build yourself, from
+      any machine on the same network:
+    </p>
+    <pre id="log2">
+curl -H "Authorization: Bearer &lt;device token&gt;" --data-binary @patch-voice-pe.bin http://patch-voice-XXXXXX.local/update</pre
+    >
+
+    <script>
+      const log = (t) => {
+        document.getElementById("log").textContent += t + "\n";
+      };
+      if (!("serial" in navigator))
+        document.getElementById("unsupported").hidden = false;
+
+      async function sendSetup() {
+        const v = (id) => document.getElementById(id).value.trim();
+        const server = v("server").replace(/\/+$/, "");
+        if (!v("ssid") || !server || !v("token")) {
+          log("Fill in the Wi-Fi network, server address and token.");
+          return;
+        }
+        const port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+        await port.setSignals({
+          dataTerminalReady: false,
+          requestToSend: false,
+        });
+        const enc = new TextEncoder();
+        const writer = port.writable.getWriter();
+        const reader = port.readable
+          .pipeThrough(new TextDecoderStream())
+          .getReader();
+        let buf = "";
+        const replies = [];
+        let reading = true;
+        (async () => {
+          while (reading) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += value;
+            let i;
+            while ((i = buf.indexOf("\n")) >= 0) {
+              const line = buf.slice(0, i);
+              buf = buf.slice(i + 1);
+              const at = line.indexOf("SETUP ");
+              if (at >= 0) replies.push(line.slice(at + 6).trim());
+            }
+          }
+        })();
+        const send = async (line) => {
+          const before = replies.length;
+          await writer.write(enc.encode(line + "\n"));
+          for (let t = 0; t < 40 && replies.length === before; t++)
+            await new Promise((r) => setTimeout(r, 100));
+          return replies[before] ?? null;
+        };
+        // Opening the port can restart the device: wait until it answers.
+        log("Waiting for the device…");
+        let status = null;
+        for (let t = 0; t < 20 && !status; t++) status = await send("status");
+        if (!status) {
+          log(
+            "The device did not answer. Unplug it, plug it back in and try again.",
+          );
+        } else {
+          const steps = [
+            ["set wifi " + v("ssid"), "Wi-Fi network"],
+            [
+              "set wifi-password " + document.getElementById("pass").value,
+              "Wi-Fi password",
+            ],
+            ["set server " + server, "server address"],
+            ["set token " + v("token"), "token"],
+          ];
+          let ok = true;
+          for (const [cmd, what] of steps) {
+            const r = await send(cmd);
+            if (!r || !r.startsWith("ok")) {
+              log(`The device refused the ${what}: ${r ?? "no answer"}`);
+              ok = false;
+              break;
+            }
+            log(`Saved the ${what}.`);
+          }
+          if (ok) {
+            await send("apply");
+            log("Done. The device is restarting.");
+          }
+        }
+        reading = false;
+        await reader.cancel().catch(() => {});
+        writer.releaseLock();
+        await port.close().catch(() => {});
+      }
+
+      document.getElementById("send").addEventListener("click", () => {
+        sendSetup().catch((e) => log("Error: " + e.message));
+      });
+    </script>
+  </body>
+</html>
