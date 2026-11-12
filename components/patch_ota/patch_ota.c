@@ -53,17 +53,32 @@ static esp_http_client_config_t http_cfg(const char *url) {
     return c;
 }
 
+typedef struct { char *buf; size_t cap; size_t len; } body_t;
+
+static esp_err_t on_http(esp_http_client_event_t *e) {
+    // Collect the body as it arrives: perform() follows redirects (GitHub
+    // release downloads) and has consumed the response by the time it returns.
+    body_t *b = (body_t *)e->user_data;
+    if (e->event_id == HTTP_EVENT_ON_DATA && b && esp_http_client_get_status_code(e->client) == 200) {
+        size_t n = (size_t)e->data_len;
+        if (b->len + n >= b->cap) n = b->cap - 1 - b->len;
+        memcpy(b->buf + b->len, e->data, n);
+        b->len += n;
+        b->buf[b->len] = '\0';
+    }
+    return ESP_OK;
+}
+
 static bool fetch(const char *url, char *out, size_t cap) {
+    body_t body = { .buf = out, .cap = cap, .len = 0 };
+    out[0] = '\0';
     esp_http_client_config_t cfg = http_cfg(url);
+    cfg.event_handler = on_http;
+    cfg.user_data = &body;
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     if (!c) return false;
-    // Redirects (GitHub release downloads) are followed by the client.
     esp_err_t err = esp_http_client_perform(c);
-    bool ok = false;
-    if (err == ESP_OK && esp_http_client_get_status_code(c) == 200) {
-        int n = esp_http_client_read_response(c, out, (int)cap - 1);
-        if (n >= 0) { out[n] = '\0'; ok = true; }
-    }
+    bool ok = err == ESP_OK && esp_http_client_get_status_code(c) == 200 && body.len > 0;
     esp_http_client_cleanup(c);
     return ok;
 }

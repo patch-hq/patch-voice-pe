@@ -71,18 +71,23 @@ bool psu_token_device_id(const char *jwt, char *out, size_t cap) {
     return true;
 }
 
+// Only "vX.Y.Z" or "X.Y.Z" (anything after "-" or "+" ignored) is a version.
+// Anything else, such as a bare commit hash from a local build, is 0.0.0, so
+// any release counts as newer.
 static void parse_ver(const char *s, long v[3]) {
     v[0] = v[1] = v[2] = 0;
     if (!s) return;
     if (*s == 'v' || *s == 'V') s++;
+    long got[3];
     for (int i = 0; i < 3; i++) {
         char *end = NULL;
-        long x = strtol(s, &end, 10);
-        if (end == s) return;
-        v[i] = x;
-        if (*end != '.') return;
+        if (*s < '0' || *s > '9') return;
+        got[i] = strtol(s, &end, 10);
+        if (i < 2 && *end != '.') return;
+        if (i == 2 && *end != '\0' && *end != '-' && *end != '+') return;
         s = end + 1;
     }
+    v[0] = got[0]; v[1] = got[1]; v[2] = got[2];
 }
 
 int psu_version_cmp(const char *a, const char *b) {

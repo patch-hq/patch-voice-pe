@@ -38,6 +38,9 @@ static void test_version_cmp(void) {
     ASSERT_TRUE(psu_version_cmp("v2.0.0", "v1.99.99") > 0);
     ASSERT_TRUE(psu_version_cmp("v0.3.0-4-gabc", "v0.3.0") == 0);
     ASSERT_TRUE(psu_version_cmp("garbage", "v0.0.1") < 0);
+    ASSERT_TRUE(psu_version_cmp("93a0767-dirty", "v0.2.0") < 0);
+    ASSERT_TRUE(psu_version_cmp("v0.2.0-3-gabc1234-dirty", "v0.2.0") == 0);
+    ASSERT_TRUE(psu_version_cmp("v1.2", "v0.0.1") < 0);
 }
 
 int main(void) {
