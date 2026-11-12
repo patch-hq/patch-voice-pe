@@ -29,13 +29,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # the firmware version comes from `git describe`
+      - name: Version
+        # ESP-IDF reads version.txt as the firmware version.
+        run: git describe --tags --always --dirty > version.txt && cat version.txt
       - name: Build
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: v5.3.2
           target: esp32s3
           command: >-
-            git config --global --add safe.directory '*' &&
             idf.py build &&
             esptool.py --chip esp32s3 merge_bin -o build/patch-voice-pe-factory.bin
             --flash_mode dio --flash_size 16MB
