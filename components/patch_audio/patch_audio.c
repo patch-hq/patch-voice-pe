@@ -36,6 +36,7 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 #include "freertos/stream_buffer.h"
+#include "freertos/idf_additions.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_websocket_client.h"
@@ -109,6 +110,7 @@ static TaskHandle_t s_text_task = NULL;
 static QueueHandle_t s_ws_send_q = NULL;        // patch_mic_frame_t *
 static QueueHandle_t s_text_q = NULL;           // heap-alloc'd char *
 static atomic_bool s_active = false;
+static atomic_bool s_ws_connected = false;
 // Set when the host says a reply is complete (audio.tts_end): a reply shorter
 // than PREBUFFER must still play rather than wait for audio that never comes.
 static atomic_bool s_tts_flush = false;
@@ -643,7 +645,7 @@ static void mic_consumer_task(void *arg) {
     }
     s_mic_task = NULL;
     patch_mic_pump_unsubscribe(PMPS_CONSUMER_AUDIO);
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 static void ws_sender_task(void *arg) {
@@ -683,7 +685,7 @@ static void ws_sender_task(void *arg) {
     patch_mic_frame_t *f = NULL;
     while (xQueueReceive(s_ws_send_q, &f, 0) == pdTRUE) patch_mic_pump_release(f);
     s_ws_sender_task = NULL;
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 // --- text-frame dispatcher -------------------------------------------------
@@ -724,7 +726,7 @@ static void text_dispatch_task(void *arg) {
     char *body = NULL;
     while (xQueueReceive(s_text_q, &body, 0) == pdTRUE) free(body);
     s_text_task = NULL;
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 // --- WS event handler ------------------------------------------------------
@@ -737,38 +739,10 @@ static void on_ws_event(void *handler_args, esp_event_base_t base,
         case WEBSOCKET_EVENT_CONNECTED: {
             ESP_LOGI(TAG, "audio ws connected");
             s_rx_csum = 0; s_rx_ccnt = 0;   // reset received-PCM checksum per session
-            char buf[1536];
-            // Build the audio.session_start envelope via the shared pure-C
-            // encoder (patch_control_frames). surfaceKind=="device" REQUIRES a
-            // deviceId (wire audio.ts validateDeviceIdCoupling) and the
-            // daemon-pushed voice token must be present — the encoder fails
-            // loud on either, no fallback. Using the shared encoder keeps the
-            // exact wire bytes identical to what the host-test harness asserts
-            // (TF1 F1-11) so there is no test/ship drift.
-            size_t n = 0;
-            pcf_status_t st = pcf_encode_audio_session_start(
-                buf, sizeof buf, &n,
-                s_cfg.session_id, s_cfg.account_id, s_cfg.surface_id,
-                s_cfg.device_id, s_cfg.chat_id, s_cfg.voice_token);
-            if (st != PCF_OK) {
-                ESP_LOGE(TAG, "audio.session_start encode failed (%d); aborting", (int)st);
-                esp_websocket_client_close(s_ws, pdMS_TO_TICKS(100));
-                return;
-            }
-            esp_websocket_client_send_text(s_ws, buf, (int)n, pdMS_TO_TICKS(200));
-
-            // Spawn pipeline tasks. Subscribe to the mic pump first so the
-            // consumer task gets the queue handle. Both pinned to core 0
-            // (Wi-Fi/LWIP core); wakeword stays on core 1.
-            QueueHandle_t pump_q = (QueueHandle_t)patch_mic_pump_subscribe(PMPS_CONSUMER_AUDIO);
-            if (!pump_q) {
-                ESP_LOGE(TAG, "mic pump subscribe failed");
-                esp_websocket_client_close(s_ws, pdMS_TO_TICKS(100));
-                return;
-            }
-            xTaskCreatePinnedToCore(mic_consumer_task, "patch-mic", 8192, pump_q, 6, &s_mic_task, 0);
-            xTaskCreatePinnedToCore(ws_sender_task, "patch-ws-tx", 8192, NULL, 6, &s_ws_sender_task, 0);
-            xTaskCreatePinnedToCore(text_dispatch_task, "patch-ws-rx", 4096, NULL, 5, &s_text_task, 0);
+            // The session_start frame and the pipeline tasks are started by
+            // session_start_task, not here: work done inside this handler over
+            // a TLS link stalled after the first task was created.
+            atomic_store(&s_ws_connected, true);
             break;
         }
         case WEBSOCKET_EVENT_DATA: {
@@ -999,6 +973,58 @@ void patch_audio_ringtone_stop(void) {
 // task, then dies. Errors atomically flip s_active back to false so the
 // next session_start can proceed.
 
+static bool start_uplink(void) {
+    static char buf[1536];
+    // Build the audio.session_start envelope via the shared pure-C
+    // encoder (patch_control_frames). surfaceKind=="device" REQUIRES a
+    // deviceId (wire audio.ts validateDeviceIdCoupling) and the
+    // daemon-pushed voice token must be present — the encoder fails
+    // loud on either, no fallback. Using the shared encoder keeps the
+    // exact wire bytes identical to what the host-test harness asserts
+    // (TF1 F1-11) so there is no test/ship drift.
+    size_t n = 0;
+    pcf_status_t st = pcf_encode_audio_session_start(
+        buf, sizeof buf, &n,
+        s_cfg.session_id, s_cfg.account_id, s_cfg.surface_id,
+        s_cfg.device_id, s_cfg.chat_id, s_cfg.voice_token);
+    if (st != PCF_OK) {
+        ESP_LOGE(TAG, "audio.session_start encode failed (%d); aborting", (int)st);
+        esp_websocket_client_close(s_ws, pdMS_TO_TICKS(100));
+        return false;
+    }
+    esp_websocket_client_send_text(s_ws, buf, (int)n, pdMS_TO_TICKS(200));
+
+    // Spawn pipeline tasks. Subscribe to the mic pump first so the
+    // consumer task gets the queue handle. Both pinned to core 0
+    // (Wi-Fi/LWIP core); wakeword stays on core 1.
+    QueueHandle_t pump_q = (QueueHandle_t)patch_mic_pump_subscribe(PMPS_CONSUMER_AUDIO);
+    if (!pump_q) {
+        ESP_LOGE(TAG, "mic pump subscribe failed");
+        esp_websocket_client_close(s_ws, pdMS_TO_TICKS(100));
+        return false;
+    }
+    // Stacks in PSRAM: with a TLS session open, internal RAM can be too
+    // short for three more stacks, and a task that silently fails to
+    // start leaves the uplink queue full and the host hearing nothing.
+    // Stacks in PSRAM: with the control and audio TLS sessions both open,
+    // internal RAM is too short for these stacks.
+    const UBaseType_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    bool started =
+        xTaskCreatePinnedToCoreWithCaps(ws_sender_task, "patch-ws-tx", 8192, NULL, 6, &s_ws_sender_task, 0, caps) == pdPASS &&
+        xTaskCreatePinnedToCoreWithCaps(text_dispatch_task, "patch-ws-rx", 4096, NULL, 5, &s_text_task, 0, caps) == pdPASS &&
+        xTaskCreatePinnedToCoreWithCaps(mic_consumer_task, "patch-mic", 8192, pump_q, 6, &s_mic_task, 0, caps) == pdPASS;
+    ESP_LOGI(TAG, "audio tasks: started=%d mic=%p tx=%p rx=%p free internal %u", (int)started,
+             (void *)s_mic_task, (void *)s_ws_sender_task, (void *)s_text_task,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    if (!started) {
+        ESP_LOGE(TAG, "audio tasks failed to start (free internal %u, psram %u); closing session",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        esp_websocket_client_close(s_ws, pdMS_TO_TICKS(100));
+    }
+    return started;
+}
+
 static void session_start_task(void *arg) {
     (void)arg;
     char uri[256];
@@ -1033,7 +1059,21 @@ static void session_start_task(void *arg) {
     s_send_drops = 0;
     s_ws = ws;
     esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, on_ws_event, NULL);
+    atomic_store(&s_ws_connected, false);
     esp_err_t err = esp_websocket_client_start(s_ws);
+    if (err == ESP_OK) {
+        // Wait for the socket to open, then send audio.session_start and start
+        // the uplink here, on a normal task.
+        for (int i = 0; i < 150 && atomic_load(&s_active) && !atomic_load(&s_ws_connected); i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (atomic_load(&s_ws_connected) && atomic_load(&s_active)) {
+            start_uplink();
+        } else if (atomic_load(&s_active)) {
+            ESP_LOGE(TAG, "audio ws did not open within 15 s");
+            esp_websocket_client_close(s_ws, pdMS_TO_TICKS(100));
+        }
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "ws start err=%d", err);
         esp_websocket_client_destroy(s_ws);
