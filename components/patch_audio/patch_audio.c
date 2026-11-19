@@ -74,7 +74,6 @@ static const char *TAG = "patch-audio";
 #define TX_DMA_DESC_NUM      4
 #define TX_DMA_FRAME_NUM     480
 
-#define WS_SENDER_QUEUE_LEN  4
 #define TEXT_QUEUE_LEN       8
 #define TEXT_FRAME_MAX       512
 
@@ -107,7 +106,10 @@ static SemaphoreHandle_t s_lock = NULL;
 static TaskHandle_t s_mic_task = NULL;
 static TaskHandle_t s_ws_sender_task = NULL;
 static TaskHandle_t s_text_task = NULL;
-static QueueHandle_t s_ws_send_q = NULL;        // patch_mic_frame_t *
+// Mic PCM waiting to go up. The mic task starts filling it at wake, before the
+// audio socket is open, so the first words survive the ~1.5 s TLS connect.
+#define UPLINK_BUF_BYTES (16000 * 2 * 8)
+static StreamBufferHandle_t s_up_buf = NULL;
 static QueueHandle_t s_text_q = NULL;           // heap-alloc'd char *
 static atomic_bool s_active = false;
 static atomic_bool s_ws_connected = false;
@@ -632,14 +634,16 @@ static void mic_consumer_task(void *arg) {
             }
             atomic_store(&s_mic_peak, pk);
         }
-        // Hand off to the WS sender. Non-blocking: if the queue is full,
-        // the TLS write is behind — drop this frame deliberately and emit
-        // a metric. NOT a fallback; this is an explicit drop with telemetry.
-        if (xQueueSend(s_ws_send_q, &f, 0) != pdTRUE) {
-            patch_mic_pump_release(f);
+        // Copy into the uplink buffer and free the pump slot at once. If the
+        // buffer is full the TLS write is far behind: drop with a metric.
+        size_t fb = patch_mic_frame_samples(f) * sizeof(int16_t);
+        bool queued = xStreamBufferSpacesAvailable(s_up_buf) >= fb &&
+                      xStreamBufferSend(s_up_buf, patch_mic_frame_data(f), fb, 0) == fb;
+        patch_mic_pump_release(f);
+        if (!queued) {
             s_send_drops++;
             if ((s_send_drops % 50) == 1) {
-                ESP_LOGW(TAG, "ws send queue full; %u frames dropped", (unsigned)s_send_drops);
+                ESP_LOGW(TAG, "uplink buffer full; %u frames dropped", (unsigned)s_send_drops);
             }
         }
     }
@@ -650,40 +654,29 @@ static void mic_consumer_task(void *arg) {
 
 static void ws_sender_task(void *arg) {
     (void)arg;
+    static int16_t chunk[PATCH_MIC_PUMP_FRAME_SAMPLES];
+    size_t have = 0;
     while (atomic_load(&s_active)) {
-        patch_mic_frame_t *f = NULL;
-        if (xQueueReceive(s_ws_send_q, &f, pdMS_TO_TICKS(50)) != pdTRUE) continue;
-        // EXPERIMENT: skip the mic uplink while TTS is actively playing (a frame
-        // arrived in the last 150 ms) so the speaker-TX path isn't contended by
-        // concurrent mic-RX/uplink. Drop the frame (don't send) and continue.
-        if (esp_timer_get_time() - s_last_tts_us < 150000) {
-            patch_mic_pump_release(f);
-            continue;
+        have += xStreamBufferReceive(s_up_buf, (uint8_t *)chunk + have, sizeof chunk - have,
+                                     pdMS_TO_TICKS(50));
+        if (have < sizeof chunk) continue;
+        have = 0;
+        // Skip the mic uplink while TTS is actively playing (a frame arrived in
+        // the last 150 ms) so the speaker-TX path isn't contended.
+        if (esp_timer_get_time() - s_last_tts_us < 150000) continue;
+        if (!s_ws || !esp_websocket_client_is_connected(s_ws)) continue;
+        const size_t ns = PATCH_MIC_PUMP_FRAME_SAMPLES;
+        bool playing = xStreamBufferBytesAvailable(s_play_buf) > 0 ||
+                       esp_timer_get_time() - s_last_play_us < ECHO_TAIL_US;
+        if (playing) {
+            // Turn the device's own voice right down so the host doesn't
+            // transcribe it as the user.
+            for (size_t i = 0; i < ns; i++) chunk[i] = (int16_t)(chunk[i] / 64);
         }
-        if (s_ws && esp_websocket_client_is_connected(s_ws)) {
-            const int16_t *pcm = patch_mic_frame_data(f);
-            size_t ns = patch_mic_frame_samples(f);
-            size_t bytes = ns * sizeof(int16_t);
-            static int16_t ducked[1024];
-            bool playing = xStreamBufferBytesAvailable(s_play_buf) > 0 ||
-                           esp_timer_get_time() - s_last_play_us < ECHO_TAIL_US;
-            if (playing && ns <= 1024) {
-                // Turn the device's own voice right down so the host doesn't
-                // transcribe it as the user (frames are shared with the wake word).
-                for (size_t i = 0; i < ns; i++) ducked[i] = (int16_t)(pcm[i] / 64);
-                pcm = ducked;
-            }
-            // Allow up to 50 ms blocking here — we have a 4-deep queue
-            // upstream that absorbs that jitter without dropping audio.
-            int sent = esp_websocket_client_send_bin(
-                s_ws, (const char *)pcm, bytes, pdMS_TO_TICKS(50));
-            if (sent < 0) ESP_LOGW(TAG, "ws send_bin failed");
-        }
-        patch_mic_pump_release(f);
+        int sent = esp_websocket_client_send_bin(s_ws, (const char *)chunk, sizeof chunk,
+                                                 pdMS_TO_TICKS(50));
+        if (sent < 0) ESP_LOGW(TAG, "ws send_bin failed");
     }
-    // Drain queue on exit.
-    patch_mic_frame_t *f = NULL;
-    while (xQueueReceive(s_ws_send_q, &f, 0) == pdTRUE) patch_mic_pump_release(f);
     s_ws_sender_task = NULL;
     vTaskDeleteWithCaps(NULL);
 }
@@ -994,28 +987,13 @@ static bool start_uplink(void) {
     }
     esp_websocket_client_send_text(s_ws, buf, (int)n, pdMS_TO_TICKS(200));
 
-    // Spawn pipeline tasks. Subscribe to the mic pump first so the
-    // consumer task gets the queue handle. Both pinned to core 0
-    // (Wi-Fi/LWIP core); wakeword stays on core 1.
-    QueueHandle_t pump_q = (QueueHandle_t)patch_mic_pump_subscribe(PMPS_CONSUMER_AUDIO);
-    if (!pump_q) {
-        ESP_LOGE(TAG, "mic pump subscribe failed");
-        esp_websocket_client_close(s_ws, pdMS_TO_TICKS(100));
-        return false;
-    }
-    // Stacks in PSRAM: with a TLS session open, internal RAM can be too
-    // short for three more stacks, and a task that silently fails to
-    // start leaves the uplink queue full and the host hearing nothing.
-    // Stacks in PSRAM: with the control and audio TLS sessions both open,
-    // internal RAM is too short for these stacks.
+    // The mic task is already running (started at wake); add the sender and
+    // the text dispatcher. Stacks in PSRAM: with the control and audio TLS
+    // sessions both open, internal RAM is too short for them.
     const UBaseType_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     bool started =
         xTaskCreatePinnedToCoreWithCaps(ws_sender_task, "patch-ws-tx", 8192, NULL, 6, &s_ws_sender_task, 0, caps) == pdPASS &&
-        xTaskCreatePinnedToCoreWithCaps(text_dispatch_task, "patch-ws-rx", 4096, NULL, 5, &s_text_task, 0, caps) == pdPASS &&
-        xTaskCreatePinnedToCoreWithCaps(mic_consumer_task, "patch-mic", 8192, pump_q, 6, &s_mic_task, 0, caps) == pdPASS;
-    ESP_LOGI(TAG, "audio tasks: started=%d mic=%p tx=%p rx=%p free internal %u", (int)started,
-             (void *)s_mic_task, (void *)s_ws_sender_task, (void *)s_text_task,
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        xTaskCreatePinnedToCoreWithCaps(text_dispatch_task, "patch-ws-rx", 4096, NULL, 5, &s_text_task, 0, caps) == pdPASS;
     if (!started) {
         ESP_LOGE(TAG, "audio tasks failed to start (free internal %u, psram %u); closing session",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -1054,9 +1032,26 @@ static void session_start_task(void *arg) {
     }
     // Allocate the per-session queues now so the on_ws_event handler finds
     // them ready when CONNECTED fires.
-    s_ws_send_q = xQueueCreate(WS_SENDER_QUEUE_LEN, sizeof(patch_mic_frame_t *));
     s_text_q   = xQueueCreate(TEXT_QUEUE_LEN, sizeof(char *));
     s_send_drops = 0;
+    if (!s_up_buf) {
+        s_up_buf = xStreamBufferCreateWithCaps(UPLINK_BUF_BYTES, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    // Drop anything left from the previous session (its tasks have exited).
+    if (s_up_buf) xStreamBufferReset(s_up_buf);
+    QueueHandle_t pump_q = (QueueHandle_t)patch_mic_pump_subscribe(PMPS_CONSUMER_AUDIO);
+    if (!s_up_buf || !pump_q ||
+        xTaskCreatePinnedToCoreWithCaps(mic_consumer_task, "patch-mic", 8192, pump_q, 6, &s_mic_task, 0,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        ESP_LOGE(TAG, "mic capture failed to start; aborting session");
+        if (pump_q) patch_mic_pump_unsubscribe(PMPS_CONSUMER_AUDIO);
+        esp_websocket_client_destroy(ws);
+        if (s_text_q) { vQueueDelete(s_text_q); s_text_q = NULL; }
+        atomic_store(&s_active, false);
+        if (s_cfg.on_session_closed) s_cfg.on_session_closed(s_cfg.user);
+        vTaskDelete(NULL);
+        return;
+    }
     s_ws = ws;
     esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, on_ws_event, NULL);
     atomic_store(&s_ws_connected, false);
@@ -1078,7 +1073,6 @@ static void session_start_task(void *arg) {
         ESP_LOGE(TAG, "ws start err=%d", err);
         esp_websocket_client_destroy(s_ws);
         s_ws = NULL;
-        if (s_ws_send_q) { vQueueDelete(s_ws_send_q); s_ws_send_q = NULL; }
         if (s_text_q)   { vQueueDelete(s_text_q);    s_text_q = NULL; }
         atomic_store(&s_active, false);
         if (s_cfg.on_session_closed) s_cfg.on_session_closed(s_cfg.user);
@@ -1137,7 +1131,6 @@ void patch_audio_session_stop(const char *reason) {
     // Tasks observe s_active=false and self-delete; the queues will be
     // emptied by their drain loops. Delete queues after a short grace.
     vTaskDelay(pdMS_TO_TICKS(100));
-    if (s_ws_send_q) { vQueueDelete(s_ws_send_q); s_ws_send_q = NULL; }
     if (s_text_q)   { vQueueDelete(s_text_q);    s_text_q = NULL; }
     xSemaphoreGive(s_lock);
 }
