@@ -17,6 +17,7 @@ static patch_control_cfg_t s_cfg = {0};
 static esp_websocket_client_handle_t s_ws = NULL;
 static volatile bool s_linked = false;
 static SemaphoreHandle_t s_lock = NULL;
+static volatile bool s_closed = false;  // the client stopped itself after a clean close
 static char *s_auth_header = NULL;  // heap-allocated "Authorization: Bearer <jwt>\r\n"; references s_cfg.bearer_jwt content once
 
 static bool send_text_frame(const char *json, size_t len) {
@@ -65,8 +66,13 @@ static void on_event(void *handler_args, esp_event_base_t base,
             if (s_cfg.on_inbound) s_cfg.on_inbound(&inb, s_cfg.user);
             break;
         }
-        case WEBSOCKET_EVENT_DISCONNECTED:
         case WEBSOCKET_EVENT_CLOSED:
+            // A close the server started (a restart, a deploy) ends the
+            // client's task for good: auto-reconnect only covers network
+            // errors. The supervisor starts it again.
+            s_closed = true;
+            /* fall through */
+        case WEBSOCKET_EVENT_DISCONNECTED:
         case WEBSOCKET_EVENT_ERROR:
             if (s_linked) {
                 ESP_LOGW(TAG, "control ws lost (event=%d)", (int)event_id);
@@ -75,6 +81,21 @@ static void on_event(void *handler_args, esp_event_base_t base,
             }
             break;
         default: break;
+    }
+}
+
+static void supervisor_task(void *arg) {
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        if (!s_closed || !s_ws) continue;
+        // Jittered so a fleet a restart closed together doesn't return together.
+        vTaskDelay(pdMS_TO_TICKS(1000 + esp_random() % 2000));
+        s_closed = false;
+        esp_websocket_client_stop(s_ws);  // already stopped; clears its state
+        esp_err_t err = esp_websocket_client_start(s_ws);
+        ESP_LOGI(TAG, "control ws restarting after close: %s", esp_err_to_name(err));
+        if (err != ESP_OK) s_closed = true;  // try again next round
     }
 }
 
@@ -137,6 +158,11 @@ void patch_control_start(const patch_control_cfg_t *cfg) {
     esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, on_event, NULL);
     ESP_ERROR_CHECK(esp_websocket_client_start(s_ws));
     ESP_LOGI(TAG, "control ws started uri=%s", uri);
+    static bool supervisor_started = false;
+    if (!supervisor_started) {
+        supervisor_started = true;
+        xTaskCreate(supervisor_task, "patch-ctl-sup", 3072, NULL, 3, NULL);
+    }
 }
 
 bool patch_control_send_wake_detected(void) {
