@@ -30,6 +30,7 @@
 #include "esp_netif_sntp.h"
 #include "nvs_flash.h"
 #include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
 #include "esp_app_desc.h"
 #include "esp_mac.h"
 #include "esp_netif_ip_addr.h"
@@ -767,11 +768,16 @@ static void diag_console_task(void *arg) {
     // Room for a whole setup line (a device token is ~500 characters) arriving
     // in one burst.
     cfg.rx_buffer_size = 2048;
+    cfg.tx_buffer_size = 4096;
     if (usb_serial_jtag_driver_install(&cfg) != ESP_OK) {
         ESP_LOGW(TAG, "diag console unavailable (driver install failed)");
         vTaskDelete(NULL);
         return;
     }
+    // Route logs through the driver's buffer. The default console writes the
+    // hardware FIFO directly and spins up to 50 ms per character while the Mac
+    // holds the port open without reading it, freezing every task that logs.
+    usb_serial_jtag_vfs_use_driver();
     ESP_LOGI(TAG, "console ready (type 'status')");
     static char buf[1400];
     size_t len = 0;

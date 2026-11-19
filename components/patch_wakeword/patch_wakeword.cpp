@@ -36,6 +36,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 
 #include "freertos/FreeRTOS.h"
@@ -123,6 +124,17 @@ namespace {
 
 // Streaming microWakeWord model — a direct port of ESPHome's
 // StreamingModel/WakeWordModel inference path.
+// The pinned esp-tflite-micro conv kernel printf()s two lines on every
+// inference. When the Mac holds the USB port open without reading it, each
+// write stalls up to 50 ms, which starved the audio tasks and garbled the mic
+// uplink. Inference output goes to a sink that discards it; stdout is per task,
+// so other logging is unaffected.
+static int discard_write(void *, const char *, int n) { return n; }
+static FILE *discard_stream() {
+  static FILE *f = funopen(nullptr, nullptr, discard_write, nullptr, nullptr);
+  return f;
+}
+
 class StreamingWakeWord {
  public:
   bool setup() {
@@ -216,7 +228,11 @@ class StreamingWakeWord {
     ++current_stride_step_;
 
     if (current_stride_step_ >= stride_) {
-      if (interpreter_->Invoke() != kTfLiteOk) {
+      FILE *saved = stdout;
+      if (FILE *sink = discard_stream()) stdout = sink;
+      TfLiteStatus st = interpreter_->Invoke();
+      stdout = saved;
+      if (st != kTfLiteOk) {
         ESP_LOGW(TAG, "Invoke failed");
         return;
       }

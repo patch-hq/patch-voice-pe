@@ -113,6 +113,10 @@ static StreamBufferHandle_t s_up_buf = NULL;
 static QueueHandle_t s_text_q = NULL;           // heap-alloc'd char *
 static atomic_bool s_active = false;
 static atomic_bool s_ws_connected = false;
+// Set once the host has accepted audio.session_start (its first audio.state).
+// The host verifies the session asynchronously and closes the socket on any
+// audio that arrives before then, so the buffered audio waits for this.
+static atomic_bool s_host_ready = false;
 // Set when the host says a reply is complete (audio.tts_end): a reply shorter
 // than PREBUFFER must still play rather than wait for audio that never comes.
 static atomic_bool s_tts_flush = false;
@@ -656,6 +660,10 @@ static void ws_sender_task(void *arg) {
     (void)arg;
     static int16_t chunk[PATCH_MIC_PUMP_FRAME_SAMPLES];
     size_t have = 0;
+    for (int i = 0; i < 100 && atomic_load(&s_active) && !atomic_load(&s_host_ready); i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (!atomic_load(&s_host_ready)) ESP_LOGW(TAG, "host did not confirm the session within 5 s");
     while (atomic_load(&s_active)) {
         have += xStreamBufferReceive(s_up_buf, (uint8_t *)chunk + have, sizeof chunk - have,
                                      pdMS_TO_TICKS(50));
@@ -694,6 +702,7 @@ static void text_dispatch_task(void *arg) {
         if (strstr(body, "audio.tts_chunk")) {
             if (s_cfg.on_tts_started) s_cfg.on_tts_started(s_cfg.user);
         } else if (strstr(body, "\"audio.state\"")) {
+            atomic_store(&s_host_ready, true);
             if (s_cfg.on_state) {
                 const char *st = strstr(body, "\"state\":\"");
                 if (st) {
@@ -1055,6 +1064,7 @@ static void session_start_task(void *arg) {
     s_ws = ws;
     esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, on_ws_event, NULL);
     atomic_store(&s_ws_connected, false);
+    atomic_store(&s_host_ready, false);
     esp_err_t err = esp_websocket_client_start(s_ws);
     if (err == ESP_OK) {
         // Wait for the socket to open, then send audio.session_start and start
