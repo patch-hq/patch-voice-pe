@@ -212,7 +212,13 @@ static void pump_task(void *arg) {
                 xSemaphoreTake(s_state_lock, portMAX_DELAY);
                 f->refcount--;
                 xSemaphoreGive(s_state_lock);
-                ESP_LOGW(TAG, "consumer %d queue full; dropping frame", c);
+                // One line per 50 drops: a stall (a TLS handshake starving the
+                // wake word) otherwise logs every 20 ms and adds to the stall.
+                static uint32_t drops[PMPS_CONSUMER_COUNT];
+                if ((drops[c]++ % 50) == 0) {
+                    ESP_LOGW(TAG, "consumer %d queue full; %u frames dropped so far",
+                             c, (unsigned)drops[c]);
+                }
             }
         }
         // If every send failed, refcount is now zero — return slot.

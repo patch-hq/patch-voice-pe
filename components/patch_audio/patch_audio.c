@@ -40,6 +40,9 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_websocket_client.h"
+#include "esp_transport.h"
+#include "esp_transport_ssl.h"
+#include "esp_transport_ws.h"
 #include "patch_tls.h"
 #include "esp_timer.h"
 #include "driver/i2s_std.h"
@@ -103,6 +106,43 @@ static StreamBufferHandle_t s_play_buf = NULL;   // mono PCM16 awaiting the DAC
 static TaskHandle_t         s_play_task = NULL;   // feeder task
 static esp_websocket_client_handle_t s_ws = NULL;
 static SemaphoreHandle_t s_lock = NULL;
+
+// One TLS transport kept across conversations so each new audio connection
+// resumes the last TLS session instead of a full handshake. A full one
+// verifies the server's certificate chain in software and costs ~1.7 s on
+// this chip; a resumed one skips it.
+static esp_transport_handle_t s_tls_tr = NULL;
+static esp_transport_handle_t s_ws_tr = NULL;
+static bool s_tls_ticket = false;
+
+static void audio_transport_drop(void) {
+    if (s_ws_tr) esp_transport_destroy(s_ws_tr);  // also destroys the TLS parent
+    s_ws_tr = NULL; s_tls_tr = NULL; s_tls_ticket = false;
+}
+
+// The websocket transport for a session at `path`, resuming the saved TLS
+// session when there is one. NULL means build a client-owned transport.
+static esp_transport_handle_t audio_transport_for(const char *path, int port) {
+    if (!s_ws_tr) {
+        s_tls_tr = esp_transport_ssl_init();
+        if (!s_tls_tr) return NULL;
+        esp_transport_ssl_crt_bundle_attach(s_tls_tr, patch_tls_attach);
+        esp_transport_set_default_port(s_tls_tr, port);
+        s_ws_tr = esp_transport_ws_init(s_tls_tr);
+        if (!s_ws_tr) { esp_transport_destroy(s_tls_tr); s_tls_tr = NULL; return NULL; }
+        esp_transport_set_default_port(s_ws_tr, port);
+    }
+    esp_transport_ws_config_t wcfg = { .ws_path = path, .propagate_control_frames = true };
+    if (esp_transport_ws_set_config(s_ws_tr, &wcfg) != ESP_OK) { audio_transport_drop(); return NULL; }
+    if (s_tls_ticket &&
+        esp_transport_ssl_session_ticket_operation(s_tls_tr, ESP_TRANSPORT_SESSION_TICKET_USE) != ESP_OK) {
+        // USE failed after a SAVE: the transport may still point at a freed
+        // session, so start over with a fresh one.
+        audio_transport_drop();
+        return audio_transport_for(path, port);
+    }
+    return s_ws_tr;
+}
 static TaskHandle_t s_mic_task = NULL;
 static TaskHandle_t s_ws_sender_task = NULL;
 static TaskHandle_t s_text_task = NULL;
@@ -739,7 +779,11 @@ static void on_ws_event(void *handler_args, esp_event_base_t base,
     esp_websocket_event_data_t *d = (esp_websocket_event_data_t *)event_data;
     switch (event_id) {
         case WEBSOCKET_EVENT_CONNECTED: {
-            ESP_LOGI(TAG, "audio ws connected");
+            ESP_LOGI(TAG, "audio ws connected (%s)", s_tls_ticket ? "resumed" : "full handshake");
+            if (s_tls_tr) {
+                esp_transport_ssl_session_ticket_operation(s_tls_tr, ESP_TRANSPORT_SESSION_TICKET_SAVE);
+                s_tls_ticket = true;
+            }
             s_rx_csum = 0; s_rx_ccnt = 0;   // reset received-PCM checksum per session
             // The session_start frame and the pipeline tasks are started by
             // session_start_task, not here: work done inside this handler over
@@ -1018,10 +1062,16 @@ static void session_start_task(void *arg) {
     snprintf(uri, sizeof uri, "%s://%s:%d/audio/%s",
              s_cfg.use_tls ? "wss" : "ws",
              s_cfg.daemon_host, s_cfg.daemon_port, s_cfg.session_id);
+    char path[96];
+    snprintf(path, sizeof path, "/audio/%s", s_cfg.session_id);
     esp_websocket_client_config_t wsc = {
         .uri = uri,
+        .ext_transport = s_cfg.use_tls ? audio_transport_for(path, s_cfg.daemon_port) : NULL,
         .reconnect_timeout_ms = 0,
         .network_timeout_ms = 5000,
+        // One connection per conversation. Left on, the client reconnects a
+        // socket the server closed and replays a dead session into the next.
+        .disable_auto_reconnect = true,
         .buffer_size = 4096,
         // The default websocket_task stack (4 KB) overflows on the audio WSS:
         // on_ws_event runs TLS record handling + JSON parsing + PCM frame
@@ -1098,6 +1148,14 @@ void patch_audio_session_start(const patch_audio_session_cfg_t *cfg) {
         ESP_LOGW(TAG, "audio session already active; ignoring");
         return;
     }
+    // A session the server closed leaves its client behind (it can't be
+    // destroyed from its own event handler). Clear it before starting anew.
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_ws) {
+        esp_websocket_client_destroy(s_ws);
+        s_ws = NULL;
+    }
+    xSemaphoreGive(s_lock);
     s_cfg = *cfg;
     // Power the speaker amplifier for the duration of the session so queued
     // TTS is audible. Disabled again in patch_audio_session_stop / on close.
