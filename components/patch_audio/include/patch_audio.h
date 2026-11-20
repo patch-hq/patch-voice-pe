@@ -60,6 +60,11 @@ void patch_audio_init(void);
 
 /** Gain (linear, >= 1) applied to reply audio before a peak limiter, for volume above 0 dB. */
 void patch_audio_set_reply_gain(float gain);
+// Barge-in tuning: how far the mic is turned down while the device speaks
+// (divisor, 1 = full level), and whether it is dropped entirely during replies.
+void patch_audio_set_duck(int divisor);
+int patch_audio_get_duck(void);
+void patch_audio_set_skip_uplink_during_tts(bool skip);
 
 /** Bytes of reply audio still waiting to be played. */
 size_t patch_audio_playback_pending(void);

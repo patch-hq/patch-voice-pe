@@ -174,6 +174,14 @@ static volatile int64_t s_last_tts_us = 0;
 static patch_audio_session_cfg_t s_cfg = {0};
 static uint32_t s_send_drops = 0;
 static uint32_t s_send_lost = 0;   // mic frames lost after every send retry failed
+// While the device is speaking, the mic still goes up so the user can talk over
+// a reply (barge-in); the XMOS echo canceller removes most of the device's own
+// voice and this divisor turns what is left down so it is not heard as the user.
+// 1 = full level. Tunable from the console (`duck N`) to find the level where
+// the user is heard and the reply is not.
+static volatile int s_duck_div = 8;
+// Old behaviour, kept for A/B: drop the mic entirely while reply audio arrives.
+static volatile bool s_skip_uplink_during_tts = false;
 
 static void i2s_init(void) {
     // HA Voice PE: the TLV320AIC3204 codec (fronted by the XMOS DSP) is the
@@ -714,15 +722,16 @@ static void ws_sender_task(void *arg) {
         have = 0;
         // Skip the mic uplink while TTS is actively playing (a frame arrived in
         // the last 150 ms) so the speaker-TX path isn't contended.
-        if (esp_timer_get_time() - s_last_tts_us < 150000) continue;
+        if (s_skip_uplink_during_tts && esp_timer_get_time() - s_last_tts_us < 150000) continue;
         if (!s_ws || !esp_websocket_client_is_connected(s_ws)) continue;
         const size_t ns = PATCH_MIC_PUMP_FRAME_SAMPLES;
         bool playing = xStreamBufferBytesAvailable(s_play_buf) > 0 ||
                        esp_timer_get_time() - s_last_play_us < ECHO_TAIL_US;
-        if (playing) {
-            // Turn the device's own voice right down so the host doesn't
-            // transcribe it as the user.
-            for (size_t i = 0; i < ns; i++) chunk[i] = (int16_t)(chunk[i] / 64);
+        const int duck = s_duck_div;
+        if (playing && duck > 1) {
+            // Turn what is left of the device's own voice down so the host does
+            // not transcribe it as the user, without silencing the user.
+            for (size_t i = 0; i < ns; i++) chunk[i] = (int16_t)(chunk[i] / duck);
         }
         // A failed send_bin is almost always a missed tx-lock wait (the WS event
         // task or a control-frame send holds it), not a lost connection, and
@@ -1227,3 +1236,13 @@ bool patch_audio_session_active(void) {
 void *patch_audio_get_rx(void) {
     return (void *)s_rx;
 }
+
+void patch_audio_set_duck(int divisor) {
+    if (divisor < 1) divisor = 1;
+    if (divisor > 256) divisor = 256;
+    s_duck_div = divisor;
+}
+
+int patch_audio_get_duck(void) { return s_duck_div; }
+
+void patch_audio_set_skip_uplink_during_tts(bool skip) { s_skip_uplink_during_tts = skip; }
