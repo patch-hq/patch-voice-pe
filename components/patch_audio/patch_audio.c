@@ -149,6 +149,8 @@ static TaskHandle_t s_text_task = NULL;
 // Mic PCM waiting to go up. The mic task starts filling it at wake, before the
 // audio socket is open, so the first words survive the ~1.5 s TLS connect.
 #define UPLINK_BUF_BYTES (16000 * 2 * 8)
+#define WS_SEND_TIMEOUT_MS 200   // tx-lock wait per attempt
+#define WS_SEND_TRIES 5
 static StreamBufferHandle_t s_up_buf = NULL;
 static QueueHandle_t s_text_q = NULL;           // heap-alloc'd char *
 static atomic_bool s_active = false;
@@ -171,6 +173,7 @@ static uint32_t s_rx_ccnt = 0;   // running count of received PCM samples
 static volatile int64_t s_last_tts_us = 0;
 static patch_audio_session_cfg_t s_cfg = {0};
 static uint32_t s_send_drops = 0;
+static uint32_t s_send_lost = 0;   // mic frames lost after every send retry failed
 
 static void i2s_init(void) {
     // HA Voice PE: the TLV320AIC3204 codec (fronted by the XMOS DSP) is the
@@ -721,9 +724,22 @@ static void ws_sender_task(void *arg) {
             // transcribe it as the user.
             for (size_t i = 0; i < ns; i++) chunk[i] = (int16_t)(chunk[i] / 64);
         }
-        int sent = esp_websocket_client_send_bin(s_ws, (const char *)chunk, sizeof chunk,
-                                                 pdMS_TO_TICKS(50));
-        if (sent < 0) ESP_LOGW(TAG, "ws send_bin failed");
+        // A failed send_bin is almost always a missed tx-lock wait (the WS event
+        // task or a control-frame send holds it), not a lost connection, and
+        // nothing was written. Retry the SAME frame so the stream stays gapless
+        // (a dropped frame garbles ASR and swings speaker-match scores); the
+        // uplink buffer absorbs the wait. Give up loudly after WS_SEND_TRIES.
+        int sent = -1;
+        for (int t = 0; t < WS_SEND_TRIES && sent < 0 && atomic_load(&s_active); t++) {
+            sent = esp_websocket_client_send_bin(s_ws, (const char *)chunk, sizeof chunk,
+                                                 pdMS_TO_TICKS(WS_SEND_TIMEOUT_MS));
+            if (sent < 0 && t > 0) ESP_LOGW(TAG, "ws send_bin retry %d failed", t);
+        }
+        if (sent < 0) {
+            s_send_lost++;
+            ESP_LOGE(TAG, "ws send_bin failed after %d tries; mic frame lost (%u total)",
+                     WS_SEND_TRIES, (unsigned)s_send_lost);
+        }
     }
     s_ws_sender_task = NULL;
     vTaskDeleteWithCaps(NULL);
@@ -1093,6 +1109,7 @@ static void session_start_task(void *arg) {
     // them ready when CONNECTED fires.
     s_text_q   = xQueueCreate(TEXT_QUEUE_LEN, sizeof(char *));
     s_send_drops = 0;
+    s_send_lost = 0;
     if (!s_up_buf) {
         s_up_buf = xStreamBufferCreateWithCaps(UPLINK_BUF_BYTES, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
