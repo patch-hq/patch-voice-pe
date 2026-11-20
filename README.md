@@ -1,6 +1,6 @@
 # Patch Voice PE
 
-Firmware that turns a [Home Assistant Voice Preview Edition](https://www.home-assistant.io/voice-pe/) into a voice device for [Patch](https://github.com/patch-hq/patch). Say "Hey Jarvis", talk, and Patch answers out loud. Patch does all the thinking; the device listens, plays the reply and shows what is happening on its light ring.
+Firmware that turns a [Home Assistant Voice Preview Edition](https://www.home-assistant.io/voice-pe/) into a voice device for [Patch](https://github.com/patch-hq/patch). Say "Hey Patch", talk, and Patch answers out loud. Patch does all the thinking; the device listens, plays the reply and shows what is happening on its light ring.
 
 It speaks Patch's generic voice-device endpoint (Patch `spec/16-voice-device.md`). Nothing here is needed by Patch itself, and the firmware has its own releases.
 
@@ -16,7 +16,7 @@ The device restarts and connects. To remove it, revoke it in the same Patch sett
 
 | Light                          | Meaning                                   |
 | ------------------------------ | ----------------------------------------- |
-| Off                            | Waiting for "Hey Jarvis"                  |
+| Off                            | Waiting for "Hey Patch"                  |
 | One white flash                | Heard the wake word                       |
 | Solid white                    | Listening                                 |
 | Spinning white                 | Thinking                                  |
@@ -26,7 +26,7 @@ The device restarts and connects. To remove it, revoke it in the same Patch sett
 | Slow red pulse                 | Can't reach Patch                         |
 | Blue spinning                  | Not set up yet                            |
 
-- Say "Hey Jarvis" or press the button while it is speaking to interrupt it.
+- Say "Hey Patch" or press the button while it is speaking to interrupt it.
 - Turn the dial to change the volume (0 to 10, remembered across restarts).
 - Hold the button for 10 seconds to forget the server and token.
 

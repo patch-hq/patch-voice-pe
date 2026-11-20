@@ -1,5 +1,5 @@
 // On-device wake-word using esp-sr's WakeNet (the same model HA Assist uses
-// when `use_wake_word: true` is set on the HA Voice PE; "Hey Jarvis" / "Hi
+// when `use_wake_word: true` is set on the HA Voice PE; "Hey Patch" / "Hi
 // ESP" / "Alexa" depending on the model selected via menuconfig).
 //
 // Runs continuously on a dedicated task. When a wake fires, the registered
