@@ -756,9 +756,20 @@ static void handle_diag_line(const char *line) {
         sscanf(line + 4, "%d %d", &a, &b);
         ESP_LOGW(TAG, "diag: xmos pipeline ch0=%d ch1=%d -> %d", a, b,
                  (int)patch_codec_set_xmos_pipeline(a, b));
+    } else if (strncmp(line, "duck", 4) == 0) {
+        // "duck N": turn the mic down N-fold while the device speaks (1 = off).
+        int n = patch_audio_get_duck();
+        sscanf(line + 4, "%d", &n);
+        patch_audio_set_duck(n);
+        ESP_LOGW(TAG, "diag: duck divisor %d", patch_audio_get_duck());
+    } else if (strncmp(line, "ttsup", 5) == 0) {
+        // "ttsup off": drop the mic entirely while reply audio arrives (old behaviour).
+        bool skip = strstr(line + 5, "off") != NULL;
+        patch_audio_set_skip_uplink_during_tts(skip);
+        ESP_LOGW(TAG, "diag: mic during replies %s", skip ? "dropped" : "sent");
     } else if (line[0] != '\0') {
         ESP_LOGW(TAG, "diag: unknown command '%s' "
-                      "(try: mute on|off|read, button down|up|release, tone, xmos)", line);
+                      "(try: mute on|off|read, button down|up|release, tone, xmos, duck N, ttsup on|off)", line);
     }
 }
 
