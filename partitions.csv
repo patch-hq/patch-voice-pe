@@ -3,7 +3,7 @@
 # headroom for signed images). nvs_keys is reserved for encrypted NVS (surface
 # JWT lives in `patch.cred`).
 #
-# The wake-word engine is microWakeWord (TFLite-Micro): its ~52 KB hey_jarvis
+# The wake-word engine is microWakeWord (TFLite-Micro): its ~52 KB hey_patch
 # model FlatBuffer is EMBED_FILES'd into the app image itself, so — unlike the
 # old esp-sr WakeNet path — no flash model partition is needed. The trailing
 # `model` SPIFFS partition is kept (same offsets) only so that units already

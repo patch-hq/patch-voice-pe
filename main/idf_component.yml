@@ -12,7 +12,7 @@ dependencies:
     # HA Assist uses (spec/16-voice-device.md, spec/18-tech-stack.md). Provides
     # the MicroInterpreter, the (esp-nn accelerated) op kernels, and
     # resource-variable support. The microWakeWord audio "micro frontend"
-    # feature lib + the pretrained hey_jarvis model are vendored in
+    # feature lib + the trained hey_patch model are vendored in
     # components/patch_wakeword (esp-tflite-micro does not ship the frontend).
     version: '==1.3.3'
 

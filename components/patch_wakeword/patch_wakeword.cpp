@@ -5,8 +5,7 @@
 // same TFLite-Micro wake engine Home Assistant Assist uses — NOT esp-sr
 // WakeNet. WakeNet's stock models are Mandarin ("Hi Lexin") and its English
 // catalogue is a fixed set; microWakeWord is the HA-native path and lets us
-// ship the pretrained 'hey_jarvis' model as the interim wake word (a custom
-// 'Hey Patch' model is a documented follow-up; not trained here).
+// ship our own 'Hey Patch' model (trained with wakeword-training/).
 //
 // Pipeline (matches the ESPHome micro_wake_word component, which is the
 // reference implementation of this engine):
@@ -19,7 +18,7 @@
 //     -> sliding window of the last N probabilities; detection when their sum
 //        exceeds probability_cutoff * N (after a warm-up of MIN_SLICES windows).
 //
-// The hey_jarvis.tflite FlatBuffer + its manifest params are bundled into the
+// The hey_patch.tflite FlatBuffer + its manifest params are bundled into the
 // app image via EMBED_FILES (see CMakeLists.txt) — no separate flash partition,
 // no esp-sr srmodels.bin.
 //
@@ -89,7 +88,7 @@ static const int PCAN_GAIN_CONTROL_GAIN_BITS = 21;
 static const int LOG_SCALE_ENABLE_LOG = 1;
 static const int LOG_SCALE_SCALE_SHIFT = 6;
 
-// hey_jarvis.json manifest params (models/v2/hey_jarvis.json):
+// hey_patch.json manifest params (models/v2/hey_patch.json):
 //   probability_cutoff: 0.97, sliding_window_size: 5, tensor_arena_size: 22860.
 // probability_cutoff is quantised 0.0-1.0 -> 0-255 (the streaming model emits a
 // uint8 probability), matching ESPHome's WakeWordModel.
@@ -104,9 +103,9 @@ static const size_t TENSOR_ARENA_SIZE = 28 * 1024;
 static const size_t VAR_ARENA_SIZE = 1024;
 static const int MIN_SLICES_BEFORE_DETECTION = 100;  // warm-up before any fire
 
-// Embedded model FlatBuffer (CMakeLists EMBED_FILES "model/hey_jarvis.tflite").
-extern const uint8_t hey_jarvis_tflite_start[] asm("_binary_hey_jarvis_tflite_start");
-extern const uint8_t hey_jarvis_tflite_end[] asm("_binary_hey_jarvis_tflite_end");
+// Embedded model FlatBuffer (CMakeLists EMBED_FILES "model/hey_patch.tflite").
+extern const uint8_t hey_patch_tflite_start[] asm("_binary_hey_patch_tflite_start");
+extern const uint8_t hey_patch_tflite_end[] asm("_binary_hey_patch_tflite_end");
 
 // ---------------------------------------------------------------------------
 // Module state
@@ -156,7 +155,7 @@ class StreamingWakeWord {
       return false;
     }
 
-    const tflite::Model *model = tflite::GetModel(hey_jarvis_tflite_start);
+    const tflite::Model *model = tflite::GetModel(hey_patch_tflite_start);
     if (model->version() != TFLITE_SCHEMA_VERSION) {
       ESP_LOGE(TAG, "model schema %lu != supported %d",
                (unsigned long) model->version(), TFLITE_SCHEMA_VERSION);
@@ -202,7 +201,7 @@ class StreamingWakeWord {
     // v2 microWakeWord models carry their own input quantization (scale + zero
     // point). The feature path quantizes the float spectrogram into this int8
     // grid; reading it from the model (not hard-coding) keeps us correct across
-    // model revisions. hey_jarvis.tflite: scale=0.101961 zp=-128.
+    // model revisions. hey_patch.tflite: scale=0.101961 zp=-128.
     input_scale_ = input->params.scale;
     input_zero_point_ = input->params.zero_point;
     if (input_scale_ <= 0.0f) {
@@ -210,7 +209,7 @@ class StreamingWakeWord {
       return false;
     }
     recent_probabilities_.assign(SLIDING_WINDOW_SIZE, 0);
-    ESP_LOGI(TAG, "microWakeWord ready: 'Hey Jarvis' stride=%u cutoff=%u/255 window=%u arena_used=%u in_scale=%.6f in_zp=%d",
+    ESP_LOGI(TAG, "microWakeWord ready: 'Hey Patch' stride=%u cutoff=%u/255 window=%u arena_used=%u in_scale=%.6f in_zp=%d",
              stride_, PROBABILITY_CUTOFF_Q8, (unsigned) SLIDING_WINDOW_SIZE,
              (unsigned) interpreter_->arena_used_bytes(),
              input_scale_, input_zero_point_);
@@ -323,7 +322,7 @@ StreamingWakeWord s_model;
 // (value*256+333)/666 - 128, which maps the small v2 frontend range almost
 // entirely onto INT8_MIN — so every inference saw "silence" and peak_prob
 // pinned at 0/255 even with real speech. Verified offline against the real
-// hey_jarvis.tflite: this scaling drives a spoken/played "Hey Jarvis" to 255
+// hey_patch.tflite: this scaling drives a spoken/played "Hey Patch" to 255
 // while silence/noise stay 0 (see .tmp/f1-prov reference harness).
 static const float FEATURE_FLOAT_SCALE = 25.6f;
 
@@ -425,7 +424,7 @@ void wakeword_task(void *arg) {
                        s_model.input_zero_point(), feats);
         s_model.infer(feats);
         if (s_model.detected()) {
-          ESP_LOGI(TAG, "wake word detected! ('Hey Jarvis')");
+          ESP_LOGI(TAG, "wake word detected! ('Hey Patch')");
           if (!s_paused && s_handler) s_handler(s_user);
         }
       }

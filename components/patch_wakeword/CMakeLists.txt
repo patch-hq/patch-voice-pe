@@ -11,8 +11,8 @@
 #   SRCS — kiss_fft_int16.cc #includes them inside the kissfft_fixed16 namespace
 #   with FIXED_POINT=16. Compiling them standalone would double-define symbols.
 #
-# The hey_jarvis.tflite FlatBuffer is embedded into the app image (EMBED_FILES)
-# and reached via _binary_hey_jarvis_tflite_{start,end}.
+# The hey_patch.tflite FlatBuffer is embedded into the app image (EMBED_FILES)
+# and reached via _binary_hey_patch_tflite_{start,end}.
 
 set(MF_LIB "microfrontend/tensorflow/lite/experimental/microfrontend/lib")
 
@@ -42,7 +42,7 @@ idf_component_register(
         "microfrontend/third_party/kissfft"
     REQUIRES patch_audio patch_mic_pump patch_state
     PRIV_REQUIRES esp-tflite-micro driver log freertos esp_psram
-    EMBED_FILES "model/hey_jarvis.tflite"
+    EMBED_FILES "model/hey_patch.tflite"
 )
 
 # The vendored microfrontend + kissfft sources are upstream third-party C/C++;

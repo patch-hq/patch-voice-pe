@@ -138,22 +138,22 @@ stereo`, resampler speakers output 48 kHz.
   pattern reduced the _mid-audio_ buzz but could NOT remove the end pop (that was
   causes 1+2 above). Don't reintroduce per-utterance amp-off.
 
-## 4. Wakeword (microWakeWord "Hey Jarvis") — memory & mute
+## 4. Wakeword (microWakeWord "Hey Patch") — memory & mute
 
 - Engine: **microWakeWord** (TFLite-Micro, HA's), NOT ESP-SR WakeNet. Model
-  `model/hey_jarvis.tflite`. Feature scaling: `int8 = round(frontend/25.6 /
+  `model/hey_patch.tflite`. Feature scaling: `int8 = round(frontend/25.6 /
 input_scale) + zp` (input_scale 0.101961, zp −128) — the v2 path. The v1
   ESPHome `(v*256+333)/666-128` formula maps everything to INT8_MIN → peak stuck
   at 0. Don't regress that.
 - It WORKS: the real phrase hits `peak_prob=255/255` (cutoff 247) → `wake word
-detected! ('Hey Jarvis')`. `peak_prob=0` with loud ambient is CORRECT (ambient
+detected! ('Hey Patch')`. `peak_prob=0` with loud ambient is CORRECT (ambient
   ≠ the wake phrase). The user's live voice triggers more reliably than `afplay`.
   To open a session WITHOUT speaking, use the **`wake` diag command** (§10) which
   fires the same `wake_detected` control frame.
 - **MEMORY: the TFLite arena needs ~28 KB of INTERNAL RAM at boot.** If you grow
   other internal-RAM allocations (big I2S DMA, FreeRTOS stream buffers, task
   stacks) the arena alloc fails → `microWakeWord model setup failed; wake word
-DISABLED` → "Hey Jarvis does nothing" with NO crash. Mitigations: keep the **TX
+DISABLED` → "Hey Patch does nothing" with NO crash. Mitigations: keep the **TX
   DMA small** (`dma_frame_num` MUST be ≤ 511 — IDF silently clamps; 4×480 ≈ 40 ms
   is plenty), and put the **playback jitter buffer in PSRAM**
   (`heap_caps_malloc(..., MALLOC_CAP_SPIRAM)` + `xStreamBufferCreateStatic`).
