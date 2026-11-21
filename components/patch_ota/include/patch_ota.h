@@ -18,6 +18,11 @@ void patch_ota_start(const char *running_version, const char *update_url, const 
 // Check the release manifest now (also runs on a timer).
 void patch_ota_check_now(void);
 
+// Network diagnostics: keep recent log lines in memory for GET /log, and run
+// POST /console bodies through the same handler as the USB console.
+void patch_ota_log_capture_start(void);
+void patch_ota_set_console_handler(void (*handler)(const char *line));
+
 #ifdef __cplusplus
 }
 #endif

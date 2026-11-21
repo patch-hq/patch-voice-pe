@@ -50,6 +50,7 @@
 #include "patch_control.h"
 #include "patch_provision.h"
 #include "patch_ota.h"
+#include "patch_mic_pump.h"
 
 static const char *TAG = "patch-main";
 #define FW_VERSION (esp_app_get_description()->version)
@@ -756,6 +757,12 @@ static void handle_diag_line(const char *line) {
         sscanf(line + 4, "%d %d", &a, &b);
         ESP_LOGW(TAG, "diag: xmos pipeline ch0=%d ch1=%d -> %d", a, b,
                  (int)patch_codec_set_xmos_pipeline(a, b));
+    } else if (strncmp(line, "micch", 5) == 0) {
+        // "micch 0|1": which XMOS output channel the mic frames come from.
+        int ch = patch_mic_pump_get_channel();
+        sscanf(line + 5, "%d", &ch);
+        patch_mic_pump_set_channel(ch);
+        ESP_LOGW(TAG, "diag: mic channel %d", patch_mic_pump_get_channel());
     } else if (strncmp(line, "duck", 4) == 0) {
         // "duck N": turn the mic down N-fold while the device speaks (1 = off).
         int n = patch_audio_get_duck();
@@ -812,6 +819,9 @@ static void diag_console_task(void *arg) {
 }
 
 void app_main(void) {
+    // Keep recent log lines for GET /log, so the device can be diagnosed over
+    // the network without a USB data cable.
+    patch_ota_log_capture_start();
     printf("patch voice-device boot, fw=%s\n", FW_VERSION);
 
     esp_err_t r = nvs_flash_init();
@@ -877,6 +887,7 @@ void app_main(void) {
     uint8_t mac[6];
     esp_efuse_mac_get_default(mac);
     snprintf(hostname, sizeof hostname, "patch-voice-%02x%02x%02x", mac[3], mac[4], mac[5]);
+    patch_ota_set_console_handler(handle_diag_line);
     patch_ota_start(FW_VERSION, s_prov.update_url, s_prov.token, hostname);
 
     ESP_LOGI(TAG, "patch voice-device init complete; deviceId=%s", s_prov.device_id);

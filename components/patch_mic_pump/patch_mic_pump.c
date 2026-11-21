@@ -23,6 +23,10 @@
 #include "esp_heap_caps.h"
 #include "driver/i2s_std.h"
 
+// Which XMOS output channel the mic frames come from (0 = primary, 1 = secondary);
+// switchable at runtime for A/B tests (console `micch N`).
+static volatile int s_channel = 0;
+
 static const char *TAG = "patch-mic-pump";
 
 #define FREELIST_SIZE       8       // total in-flight frames across all consumers
@@ -187,8 +191,9 @@ static void pump_task(void *arg) {
         // slot, so >>16 brings it into the int16 range without clipping (>>14
         // left ~18 bits and railed loud speech at INT16_MAX, which clipped the
         // signal and gave microWakeWord garbage spectrograms -> probability 0).
+        const int ch = s_channel;
         for (size_t i = 0; i < samples; i++) {
-            f->pcm[i] = (int16_t)(i32buf[i * I2S_CH] >> 16);
+            f->pcm[i] = (int16_t)(i32buf[i * I2S_CH + ch] >> 16);
         }
         f->samples = samples;
 
@@ -262,3 +267,6 @@ void patch_mic_pump_init(void *rx_chan) {
     // on core 1 so inference doesn't fight for the same scheduler slot.
     xTaskCreatePinnedToCore(pump_task, "patch-mic-pump", 4096, NULL, 7, &s_task, 0);
 }
+
+void patch_mic_pump_set_channel(int ch) { s_channel = (ch == 1) ? 1 : 0; }
+int patch_mic_pump_get_channel(void) { return s_channel; }

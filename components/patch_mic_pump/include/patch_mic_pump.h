@@ -50,6 +50,9 @@ void  patch_mic_pump_unsubscribe(pmps_consumer_t c);
 // Hardware-mute hint — while muted, the producer drains I2S but doesn't
 // publish to any consumer.
 void patch_mic_pump_set_muted(bool muted);
+// Pick which XMOS output channel the frames come from (0 or 1).
+void patch_mic_pump_set_channel(int ch);
+int patch_mic_pump_get_channel(void);
 
 // Release a borrowed frame back to the free list.
 void patch_mic_pump_release(const patch_mic_frame_t *f);

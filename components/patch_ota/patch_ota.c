@@ -1,6 +1,8 @@
 #include "patch_ota.h"
 
+#include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -9,6 +11,7 @@
 #include "esp_http_client.h"
 #include "esp_http_server.h"
 #include "esp_https_ota.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
@@ -135,6 +138,60 @@ void patch_ota_check_now(void) {
     timer_cb(NULL);
 }
 
+// ---------- network diagnostics ------------------------------------------------
+// The USB console's commands and log, over the network, so the device can be
+// diagnosed without a data cable: POST /console runs one command line, and
+// GET /log?since=N returns the log lines written after sequence number N.
+// Both need the device token, like /update.
+
+#define LOG_RING_BYTES (48 * 1024)
+static char *s_ring = NULL;             // PSRAM ring of '\n'-terminated lines
+static size_t s_ring_head = 0;          // next write offset
+static uint32_t s_ring_seq = 0;         // lines written so far
+static size_t s_ring_used = 0;          // bytes in use (<= LOG_RING_BYTES)
+static portMUX_TYPE s_ring_mux = portMUX_INITIALIZER_UNLOCKED;
+static vprintf_like_t s_prev_vprintf = NULL;
+static void (*s_console_handler)(const char *line) = NULL;
+
+static int ring_vprintf(const char *fmt, va_list ap) {
+    va_list copy;
+    va_copy(copy, ap);
+    int r = s_prev_vprintf ? s_prev_vprintf(fmt, ap) : vprintf(fmt, ap);
+    if (s_ring) {
+        char line[192];
+        int n = vsnprintf(line, sizeof line, fmt, copy);
+        if (n > 0) {
+            if (n > (int)sizeof line - 1) n = sizeof line - 1;
+            taskENTER_CRITICAL(&s_ring_mux);
+            for (int i = 0; i < n; i++) {
+                s_ring[s_ring_head] = line[i];
+                s_ring_head = (s_ring_head + 1) % LOG_RING_BYTES;
+            }
+            if (line[n - 1] != '\n') {
+                s_ring[s_ring_head] = '\n';
+                s_ring_head = (s_ring_head + 1) % LOG_RING_BYTES;
+                n++;
+            }
+            s_ring_used = s_ring_used + n > LOG_RING_BYTES ? LOG_RING_BYTES : s_ring_used + n;
+            s_ring_seq++;
+            taskEXIT_CRITICAL(&s_ring_mux);
+        }
+    }
+    va_end(copy);
+    return r;
+}
+
+void patch_ota_log_capture_start(void) {
+    if (s_ring) return;
+    s_ring = heap_caps_calloc(1, LOG_RING_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_ring) return;
+    s_prev_vprintf = esp_log_set_vprintf(ring_vprintf);
+}
+
+void patch_ota_set_console_handler(void (*handler)(const char *line)) {
+    s_console_handler = handler;
+}
+
 // ---------- push endpoint -----------------------------------------------------
 
 static bool authorised(httpd_req_t *req) {
@@ -190,6 +247,72 @@ static esp_err_t update_post(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t console_post(httpd_req_t *req) {
+    if (!authorised(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        return httpd_resp_sendstr(req, "send the device token as Authorization: Bearer <token>\n");
+    }
+    char line[256];
+    int len = req->content_len < (int)sizeof line - 1 ? req->content_len : (int)sizeof line - 1;
+    int got = 0;
+    while (got < len) {
+        int n = httpd_req_recv(req, line + got, len - got);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (n <= 0) break;
+        got += n;
+    }
+    line[got] = '\0';
+    while (got > 0 && (line[got - 1] == '\n' || line[got - 1] == '\r')) line[--got] = '\0';
+    if (!s_console_handler || got == 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "send one console command as the body\n");
+    }
+    ESP_LOGI(TAG, "network console: %s", line);
+    s_console_handler(line);
+    char seq[48];
+    snprintf(seq, sizeof seq, "ok %u\n", (unsigned)s_ring_seq);
+    return httpd_resp_sendstr(req, seq);
+}
+
+static esp_err_t log_get(httpd_req_t *req) {
+    if (!authorised(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        return httpd_resp_sendstr(req, "send the device token as Authorization: Bearer <token>\n");
+    }
+    if (!s_ring) return httpd_resp_sendstr(req, "");
+    // Lines are returned oldest first, with the current sequence number in a
+    // header so the caller can ask for only newer ones next time.
+    uint32_t since = 0;
+    char q[48], v[16];
+    if (httpd_req_get_url_query_str(req, q, sizeof q) == ESP_OK &&
+        httpd_query_key_value(q, "since", v, sizeof v) == ESP_OK) {
+        since = (uint32_t)strtoul(v, NULL, 10);
+    }
+    char *copy = heap_caps_malloc(LOG_RING_BYTES + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!copy) return httpd_resp_send_500(req);
+    taskENTER_CRITICAL(&s_ring_mux);
+    size_t used = s_ring_used, head = s_ring_head;
+    uint32_t seq = s_ring_seq;
+    size_t start = (head + LOG_RING_BYTES - used) % LOG_RING_BYTES;
+    for (size_t i = 0; i < used; i++) copy[i] = s_ring[(start + i) % LOG_RING_BYTES];
+    taskEXIT_CRITICAL(&s_ring_mux);
+    copy[used] = '\0';
+    // Skip whole lines until only the last (seq - since) remain.
+    size_t total = 0;
+    for (size_t i = 0; i < used; i++) if (copy[i] == '\n') total++;
+    size_t want = seq > since ? seq - since : 0;
+    size_t skip = total > want ? total - want : 0;
+    char *p = copy;
+    while (skip > 0 && *p) { if (*p++ == '\n') skip--; }
+    char seqhdr[16];
+    snprintf(seqhdr, sizeof seqhdr, "%u", (unsigned)seq);
+    httpd_resp_set_hdr(req, "X-Log-Seq", seqhdr);
+    httpd_resp_set_type(req, "text/plain");
+    esp_err_t r = httpd_resp_sendstr(req, p);
+    free(copy);
+    return r;
+}
+
 static void start_server(void) {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 8192;
@@ -201,8 +324,12 @@ static void start_server(void) {
     }
     httpd_uri_t info = { .uri = "/info", .method = HTTP_GET, .handler = info_get };
     httpd_uri_t upd = { .uri = "/update", .method = HTTP_POST, .handler = update_post };
+    httpd_uri_t con = { .uri = "/console", .method = HTTP_POST, .handler = console_post };
+    httpd_uri_t log = { .uri = "/log", .method = HTTP_GET, .handler = log_get };
     httpd_register_uri_handler(srv, &info);
     httpd_register_uri_handler(srv, &upd);
+    httpd_register_uri_handler(srv, &con);
+    httpd_register_uri_handler(srv, &log);
 }
 
 void patch_ota_start(const char *running_version, const char *update_url, const char *token,
