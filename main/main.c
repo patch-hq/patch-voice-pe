@@ -80,6 +80,7 @@ static void render_state(void);
 // Conversation state shared by the audio callbacks, follow-up timer and interruption.
 static volatile bool s_tts_active = false;
 static volatile uint32_t s_session_gen = 0;  // bumped per audio session; stale timers check it
+static void host_confirm_task(void *arg);
 static volatile bool s_reopen_after_close = false;
 #define FOLLOWUP_MS 5000  // follow-up window when Patch doesn't set one
 static volatile int s_followup_ms = FOLLOWUP_MS;
@@ -269,6 +270,7 @@ static void open_audio_session_now(void) {
     s_session_gen++;
     s_tts_active = false;
     patch_audio_session_start(&cfg);
+    xTaskCreate(host_confirm_task, "host-confirm", 3072, (void *)(uintptr_t)s_session_gen, 3, NULL);
     patch_led_set_phase(PLED_PHASE_LISTENING);
     pds_dispatch(&s_state, PDS_EV_AUDIO_SESSION_OPENED);
     // The wake word stays on during the session: saying it while a reply
@@ -344,6 +346,25 @@ static void end_session_now(const char *why) {
     ESP_LOGI(TAG, "ending session: %s", why);
     patch_control_send_session_end(PCF_SESSION_END_AGENT_FINISHED);
     patch_audio_session_stop("agent-finished");
+}
+
+// A session the host never confirms (its voice engine hung, or the host went
+// away) would otherwise stay open for ever, and every wake word after it would
+// be taken as an interrupt of a session that is not there. Give up on it after
+// HOST_CONFIRM_MS and go back to waiting for the wake word.
+#define HOST_CONFIRM_MS 10000
+static void host_confirm_task(void *arg) {
+    uint32_t gen = (uint32_t)(uintptr_t)arg;
+    for (int i = 0; i < HOST_CONFIRM_MS / 100; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (gen != s_session_gen || !patch_audio_session_active() || patch_audio_host_ready()) {
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+    ESP_LOGW(TAG, "host did not confirm the session within %d s; ending it", HOST_CONFIRM_MS / 1000);
+    end_session_now("host did not confirm the session");
+    vTaskDelete(NULL);
 }
 
 static void followup_task(void *arg) {

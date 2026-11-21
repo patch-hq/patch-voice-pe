@@ -62,6 +62,8 @@ void patch_audio_init(void);
 void patch_audio_set_reply_gain(float gain);
 // Barge-in tuning: how far the mic is turned down while the device speaks
 // (divisor, 1 = full level), and whether it is dropped entirely during replies.
+// True once the host has confirmed the open session (its first audio.state).
+bool patch_audio_host_ready(void);
 void patch_audio_set_duck(int divisor);
 int patch_audio_get_duck(void);
 void patch_audio_set_skip_uplink_during_tts(bool skip);

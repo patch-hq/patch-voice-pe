@@ -1229,6 +1229,8 @@ void patch_audio_session_stop(const char *reason) {
     xSemaphoreGive(s_lock);
 }
 
+bool patch_audio_host_ready(void) { return atomic_load(&s_host_ready); }
+
 bool patch_audio_session_active(void) {
     return atomic_load(&s_active);
 }
